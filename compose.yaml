@@ -7,9 +7,10 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # credentials & config (never baked into the image, see .dockerignore)
+      # config & credentials (never baked into the image, see .dockerignore)
       - ./.env:/app/.env:ro
-      # access token + remembered room id survive container rebuilds
+      - ./bots.json:/app/bots.json:ro
+      # per-bot access tokens + remembered room ids survive container rebuilds
       - matrix-webhooker-state:/app/state
     environment:
       HOST: 0.0.0.0

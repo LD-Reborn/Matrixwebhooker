@@ -1,8 +1,11 @@
 .git
 .env
+bots.json
 .token
 .room_id
-__pycache__
+*/.token
+*/.room_id
+__pycache__/
 *.pyc
 .venv
 venv

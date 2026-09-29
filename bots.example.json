@@ -1,0 +1,19 @@
+{
+  "_comment": "Bot roster — one entry per bot account (this file holds secrets: keep it out of git, see bots.json). Generate api_key with: python3 -c 'import secrets; print(secrets.token_urlsafe(24))'",
+  "bots": [
+    {
+      "name": "webhook_bot",
+      "user": "webhook_bot",
+      "password": "change-me",
+      "api_key": "change-me",
+      "room_id": null,
+      "room_name": null
+    },
+    {
+      "name": "grafana_bot",
+      "user": "grafana_bot",
+      "password": "change-me",
+      "api_key": "change-me"
+    }
+  ]
+}
