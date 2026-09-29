@@ -17,6 +17,7 @@ import os
 import secrets
 import sys
 import time
+from pathlib import Path
 from urllib.parse import quote
 
 from dotenv import load_dotenv
@@ -25,8 +26,13 @@ import requests
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
-ROOM_ID_FILE = os.path.join(BASE_DIR, ".room_id")
-TOKEN_FILE = os.path.join(BASE_DIR, ".token")
+# Where runtime state (cached access token, remembered room id) lives.
+# Defaults to the app directory; set MATRIX_STATE_DIR in containers so state
+# survives image rebuilds (mount a volume there).
+STATE_DIR = Path(os.environ.get("MATRIX_STATE_DIR", BASE_DIR))
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+ROOM_ID_FILE = STATE_DIR / ".room_id"
+TOKEN_FILE = STATE_DIR / ".token"
 
 # ---------------------------------------------------------------------------
 # Configuration

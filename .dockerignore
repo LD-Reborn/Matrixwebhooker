@@ -1,0 +1,8 @@
+.git
+.env
+.token
+.room_id
+__pycache__
+*.pyc
+.venv
+venv

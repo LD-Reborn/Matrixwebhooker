@@ -30,6 +30,26 @@ your alert system ──HTTP──▶ MatrixWebhooker ──Matrix API──▶ 
    # or: pip install -r requirements.txt && python3 server.py
    ```
 
+   **Or with Docker (recommended for always-on use):**
+
+   ```sh
+   docker compose up -d --build
+   docker compose logs -f        # follow logs
+   docker compose down           # stop (state in the matrix-webhooker-state volume is kept)
+   ```
+
+   The container runs as an unprivileged user, listens on `0.0.0.0:8080`,
+   and `restart: unless-stopped` brings it back after crashes *and* host
+   reboots — until you explicitly `docker compose down` / remove it.
+   The access token and the remembered room ID live in the
+   `matrix-webhooker-state` volume, so rebuilds don't trigger re-login.
+   `.env` is bind-mounted read-only and never baked into the image.
+
+   > Tip: for a homeserver on the *same* host (e.g. Synapse in Docker with
+   > port 8008), you may prefer
+   > `MATRIX_HOME_SERVER=http://host.docker.internal:8008` to stay on the
+   > LAN instead of public DNS.
+
 ## Usage
 
 Send an alert:
