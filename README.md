@@ -104,9 +104,56 @@ Response: `{"ok": true, "bot": "grafana_bot", "room": "!...:domain", "event_id":
 With an API key: `{"bot": "grafana_bot", "user": "@grafana_bot:...", "room": "..."}`.
 Useful to check which key you're holding.
 
+### `GET /rooms` — rooms the bot is in
+
+With the bot's API key: `{"bot": "...", "rooms": [{"room_id": "!...:domain", "name": "..."}]}`.
+
+### `GET /rooms/<room_id>/messages` — read a room
+
+Most recent room messages (default `?limit=50`, max `100`), oldest first:
+
+```json
+{"bot": "grafana_bot", "room": "!...:domain", "messages": [
+  {"event_id": "$...", "sender": "@grafana_bot:...", "msgtype": "m.text",
+   "body": "High CPU on web-1", "ts": 1790723107085}
+]}
+```
+
 ### `GET /health` — no auth
 
 Service status plus per-bot state (`connected`, `room`).
+
+## MCP server (optional)
+
+The same bot model is exposed as an MCP server (`mcp_server.py`) with four
+tools — `list_bots`, `list_rooms`, `read_messages`, `send_message` — so an
+AI assistant can read from and send to your Matrix rooms. It talks to the
+homeserver **directly**, so the HTTP server does not need to be running.
+Same config (`.env` + `bots.json`); optional `MCP_BOT` env sets the default
+bot for tool calls without a `bot` argument.
+
+```sh
+pip install -r requirements-mcp.txt     # adds the 'mcp' package
+python3 mcp_server.py                   # stdio MCP server (for manual inspection)
+```
+
+Register with OpenCode (global = available in every project):
+
+```sh
+opencode mcp add matrix --global -- python3 /path/to/MatrixWebhooker/mcp_server.py
+opencode mcp list                       # ✓ matrix  connected
+```
+
+After that, in any session you can just ask: *“list the rooms the grafana bot
+is in”*, *“read the last 20 messages of the Grafana Alerts room”*, *“tell
+webhook_bot that the deploy is done”*. Generic MCP client config (Claude
+Desktop & friends):
+
+```json
+{ "mcpServers": { "matrix": {
+    "command": "python3",
+    "args": ["/path/to/MatrixWebhooker/mcp_server.py"] } } }
+```
 
 ## Notes & limitations
 
@@ -114,3 +161,6 @@ Service status plus per-bot state (`connected`, `room`).
 - If a bot isn't in the room but has a pending invitation, it auto-joins.
 - Access tokens are cached per bot (state volume/file); on a 401 the bot
   re-logs in and retries once.
+- A bot that runs from more than one place (container + MCP server) caches a
+  separate token/login per place — that's one Matrix device each, both stay
+  valid in parallel.

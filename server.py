@@ -11,6 +11,9 @@ Endpoints:
                 "html": "optional HTML body",
                 "room_id": "optional override of the bot's default room"}
     GET  /me         which bot this API key belongs to
+    GET  /rooms      the requesting bot's joined rooms (id + name)
+    GET  /rooms/<room_id>/messages
+                     recent messages of the bot's room (?limit=50, max 100)
     GET  /health     service + per-bot status (no auth)
     GET  /           usage hints (no auth)
 
@@ -77,6 +80,8 @@ def index():
                          "room_id": "optional override of the bot's default room"},
             },
             "GET /me": "which bot an API key belongs to",
+            "GET /rooms": "the requesting bot's joined rooms",
+            "GET /rooms/<room_id>/messages": "recent messages (?limit=50, max 100)",
             "GET /health": "service + per-bot status, no auth",
         },
         "matrix": settings.homeserver,
@@ -99,6 +104,33 @@ def me():
                                  "X-API-Key (or Authorization: Bearer ...)"}), 401
     return jsonify({"bot": bot.name, "user": bot.user_id,
                     "room": bot.room_id_cached_or_pinned()})
+
+
+@app.get("/rooms")
+def rooms():
+    bot = _authed_bot()
+    if bot is None:
+        return jsonify({"error": "unauthorized: send a valid bot API key as "
+                                 "X-API-Key (or Authorization: Bearer ...)"}), 401
+    try:
+        joined = bot.client.list_rooms()
+    except MatrixError as exc:
+        return jsonify({"error": f"matrix list rooms failed: {exc}"}), 502
+    return jsonify({"bot": bot.name, "rooms": joined})
+
+
+@app.get("/rooms/<room_id>/messages")
+def messages(room_id: str):
+    bot = _authed_bot()
+    if bot is None:
+        return jsonify({"error": "unauthorized: send a valid bot API key as "
+                                 "X-API-Key (or Authorization: Bearer ...)"}), 401
+    try:
+        limit = request.args.get("limit", 50, type=int)
+        events = bot.client.read_messages(room_id, limit=limit)
+    except MatrixError as exc:
+        return jsonify({"error": f"matrix read failed: {exc}"}), 502
+    return jsonify({"bot": bot.name, "room": room_id, "messages": events})
 
 
 @app.post("/webhook")
