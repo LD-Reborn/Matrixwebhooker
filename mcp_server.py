@@ -11,9 +11,13 @@ Tools:
     list_rooms       the bot's joined rooms (id + name)
     read_messages    recent messages of a room
     send_message     send a message (m.text / m.notice, optional HTML)
+    wait_for_reply   block for the next message in a room (that message is
+                     delivered to you and skips the bot's configured triggers)
 
 Environment:
-    MCP_BOT     default bot to use when a tool doesn't get one
+    MCP_BOT               default bot to use when a tool doesn't get one
+    MATRIX_WEBHOOKER_URL  base URL of the HTTP server for wait_for_reply
+                          (default http://localhost:8080)
     (config: same .env + bots.json as server.py, BOTS_JSON to relocate)
 
 Example client registration (OpenCode / generic MCP config):
@@ -32,6 +36,7 @@ Example client registration (OpenCode / generic MCP config):
 import os
 import sys
 
+import requests
 from dotenv import load_dotenv
 
 try:
@@ -59,6 +64,12 @@ if DEFAULT_BOT and DEFAULT_BOT not in BOTS:
     sys.exit(2)
 
 mcp = FastMCP("matrix-webhooker")
+
+#: wait_for_reply is served by the long-lived HTTP server (server.py), which
+#: owns the message watcher and the trigger/wait registry.
+WEBHOOKER_URL = os.environ.get(
+    "MATRIX_WEBHOOKER_URL", "http://localhost:8080").rstrip("/")
+MAX_WAIT_TIMEOUT = 600
 
 
 def _resolve_bot(bot: str = "") -> Bot:
@@ -132,6 +143,43 @@ def send_message(text: str, bot: str = "", room: str = "",
         raise ValueError(f"matrix send failed: {exc}") from exc
     return {"ok": True, "bot": b.name, "room": room_id,
             "event_id": event.get("event_id")}
+
+
+@mcp.tool()
+def wait_for_reply(room: str, bot: str = "", timeout: int = 120) -> dict:
+    """Block up to `timeout` seconds (default 120, max 600) for the next
+    message in `room` (a Matrix room id from list_rooms; the bot must be in
+    it) that is NOT sent by the bot itself, and return it as {"received":
+    {...message...}}. On timeout: {"received": null}.
+
+    Use it to ask a question with send_message and then wait for the answer.
+    While you wait, the received message is handed to you and is deliberately
+    NOT fired through the bot's configured triggers in bots.json.
+
+    Requires the matrix-webhooker HTTP server to be running (python3
+    server.py, or docker compose); MATRIX_WEBHOOKER_URL redirects."""
+    b = _resolve_bot(bot)
+    room = room.strip()
+    if not room.startswith("!"):
+        raise ValueError("'room' must be a Matrix room id (!...) — use list_rooms first")
+    timeout = max(1, min(int(timeout), MAX_WAIT_TIMEOUT))
+    try:
+        resp = requests.post(
+            f"{WEBHOOKER_URL}/wait",
+            headers={"X-API-Key": b.cfg.api_key},
+            json={"room_id": room, "timeout": timeout},
+            timeout=timeout + 20,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise ValueError(
+            f"matrix-webhooker server unreachable at {WEBHOOKER_URL} ({exc}). "
+            "wait_for_reply is served by the long-lived server.py process (it "
+            "owns the triggers); start it (python3 server.py / docker compose) "
+            "or set MATRIX_WEBHOOKER_URL.") from exc
+    if resp.status_code >= 400:
+        raise ValueError(f"matrix-webhooker error ({resp.status_code}): "
+                         f"{resp.text.strip()[:300]}")
+    return resp.json()
 
 
 if __name__ == "__main__":

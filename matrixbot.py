@@ -19,6 +19,7 @@ import json
 import os
 import secrets
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,27 @@ class ConfigError(RuntimeError):
 
 
 @dataclass
+class Trigger:
+    """Fires when the bot receives a message (not from itself) in one room.
+
+    ``room`` matches the room's display name (case-insensitive) or a room id
+    (``!...``) — room ids are the reliable way to match DMs. ``commands`` are
+    bash command line(s) run in sequence in the app directory; the
+    placeholders ``{{channel}}`` (room name), ``{{msg}}`` (last ``context``
+    messages, newest last), ``{{sender}}`` and ``{{room}}`` (room id) are
+    substituted shell-quoted.
+    """
+    room: str
+    commands: list[str]
+    context: int = 25               # messages included in {{msg}} (max 100)
+
+    def matches(self, room_id: str, room_name: str | None) -> bool:
+        if self.room.startswith("!"):
+            return self.room.casefold() == room_id.casefold()
+        return room_name is not None and self.room.casefold() == room_name.casefold()
+
+
+@dataclass
 class BotConfig:
     name: str                       # label; also used for the state subdir
     user: str                       # Matrix localpart (no @, no domain)
@@ -46,6 +68,7 @@ class BotConfig:
     api_key: str                    # required on /webhook (X-API-Key or Bearer)
     room_id: str | None = None      # pinned room; null = remember/cache/auto-create
     room_name: str | None = None    # name for the auto-created room
+    triggers: list[Trigger] = field(default_factory=list)
 
 
 @dataclass
@@ -112,6 +135,38 @@ def load_settings() -> Settings:
             raise ConfigError(f"{path}: duplicate bot name '{name}'")
         if any(b.api_key == api_key for b in bots):
             raise ConfigError(f"{path}: duplicate api_key for bot '{name}'")
+        raw_triggers = entry.get("triggers", [])
+        if not isinstance(raw_triggers, list):
+            raise ConfigError(f"{path}: bots[{i}] ('{name}'): 'triggers' must be a list")
+        triggers: list[Trigger] = []
+        for j, t in enumerate(raw_triggers):
+            if not isinstance(t, dict):
+                raise ConfigError(f"{path}: bots[{i}] ('{name}').triggers[{j}] must be an object")
+            troom = str(t.get("room", "")).strip()
+            if not troom:
+                raise ConfigError(
+                    f"{path}: bots[{i}] ('{name}').triggers[{j}]: 'room' (name or '!...' id) is required")
+            raw_cmd = t.get("command", t.get("commands"))
+            if isinstance(raw_cmd, str):
+                cmds = [raw_cmd]
+            elif isinstance(raw_cmd, list):
+                cmds = [str(c) for c in raw_cmd]
+            else:
+                raise ConfigError(
+                    f"{path}: bots[{i}] ('{name}').triggers[{j}]: "
+                    "'command' must be a string or a list of strings")
+            if not any(c.strip() for c in cmds):
+                raise ConfigError(f"{path}: bots[{i}] ('{name}').triggers[{j}]: "
+                                  "at least one non-empty command is required")
+            try:
+                context = int(t.get("context", 25))
+            except (TypeError, ValueError):
+                raise ConfigError(f"{path}: bots[{i}] ('{name}').triggers[{j}]: "
+                                  "'context' must be an integer")
+            if not 1 <= context <= 100:
+                raise ConfigError(f"{path}: bots[{i}] ('{name}').triggers[{j}]: "
+                                  "'context' must be between 1 and 100")
+            triggers.append(Trigger(room=troom, commands=cmds, context=context))
         bots.append(BotConfig(
             name=name,
             user=user,
@@ -119,6 +174,7 @@ def load_settings() -> Settings:
             api_key=api_key,
             room_id=room_id,
             room_name=str(entry.get("room_name") or "").strip() or None,
+            triggers=triggers,
         ))
 
     return Settings(
@@ -168,6 +224,7 @@ class Matrix:
         self.token: str | None = None
         self.device_id: str | None = None
         self.http = requests.Session()
+        self._login_lock = threading.Lock()   # guards concurrent lazy logins
         self._load_stored_token()
 
     @property
@@ -204,6 +261,19 @@ class Matrix:
             pass
 
     # -- login (deliberately lazy: first authenticated call logs in) ----------
+
+    def _ensure_token(self) -> None:
+        """Double-checked: safe to call concurrently from any thread."""
+        if self.token:
+            return
+        with self._login_lock:
+            if not self.token:
+                self.login()
+
+    def _relogin(self) -> None:
+        with self._login_lock:
+            self._clear_token()
+            self.login()
 
     def login(self, retries: int = 3) -> None:
         flows = self._plain_request("GET", f"{self.hs}/_matrix/client/v3/login")["flows"]
@@ -281,6 +351,72 @@ class Matrix:
             })
         return out
 
+    def sync(self, since: str | None = None, timeout_ms: int = 30000) -> dict:
+        """One (long-polling) /sync round trip.
+
+        Returns ``{"next_batch": <token for the next call>, "events": [...]}``
+        where events are the *new* m.room.message events of the joined rooms
+        (oldest first, per room), each with ``room_id``, ``room_name``,
+        ``event_id``, ``sender``, ``msgtype``, ``body`` and ``ts``.
+        A call without ``since`` is a snapshot: its events are historical
+        and the caller must not act on them.
+        """
+        flt = json.dumps(
+            {"room": {
+                "timeline": {"types": ["m.room.message"], "limit": 100},
+                "state": {"types": ["m.room.name", "m.room.canonical_alias"]},
+            }},
+            separators=(",", ":"))
+        params: dict[str, str] = {
+            "timeout": str(max(0, min(int(timeout_ms), 30000))),
+            "filter": flt,
+        }
+        if since:
+            params["since"] = since
+        # The long-poll can hold up to timeout_ms; give the HTTP client more slack.
+        data = self._request(
+            "GET", f"{self.hs}/_matrix/client/v3/sync",
+            params=params, timeout=max(1.0, timeout_ms / 1000.0 + 10.0))
+        events: list[dict] = []
+        for room_id, rdata in (data.get("rooms", {}).get("join", {}) or {}).items():
+            name = (rdata.get("name") or {}).get("name")
+            if not name:
+                # Some Synapse versions omit the convenience field: read it
+                # from the state events (included by the filter above).
+                for se in ((rdata.get("state", {}) or {}).get("events", [])) or []:
+                    if se.get("type") == "m.room.name":
+                        name = (se.get("content") or {}).get("name") \
+                            or (se.get("content") or {}).get("body")
+                        break
+            for ev in (rdata.get("timeline", {}) or {}).get("events", []) or []:
+                if ev.get("type") != "m.room.message":
+                    continue
+                content = ev.get("content", {})
+                body = content.get("body")
+                if not isinstance(body, str):
+                    continue
+                events.append({
+                    "room_id": room_id,
+                    "room_name": name,
+                    "event_id": ev.get("event_id"),
+                    "sender": ev.get("sender"),
+                    "msgtype": content.get("msgtype", "m.text"),
+                    "body": body,
+                    "ts": ev.get("origin_server_ts"),
+                })
+        return {"next_batch": data.get("next_batch"), "events": events}
+
+    def get_room_name(self, room_id: str) -> str | None:
+        """Current m.room.name of the room (None if it has no name / no access)."""
+        try:
+            state = self._request(
+                "GET", f"{self.hs}/_matrix/client/v3/rooms/"
+                       f"{quote(room_id, safe='')}/state/m.room.name/")
+        except MatrixError:
+            return None
+        name = (state or {}).get("name")
+        return name if isinstance(name, str) and name else None
+
     def send_message(self, room_id: str, payload: dict) -> dict:
         for attempt in (1, 2):
             txn = f"whk-{secrets.token_hex(8)}"
@@ -319,25 +455,25 @@ class Matrix:
 
     # -- internals -------------------------------------------------------------
 
-    def _plain_request(self, method: str, url: str) -> dict:
-        resp = self.http.request(method, url, timeout=self.timeout)
+    def _plain_request(self, method: str, url: str, params: dict | None = None) -> dict:
+        resp = self.http.request(method, url, timeout=self.timeout, params=params)
         if resp.status_code >= 400:
             raise MatrixError(resp.status_code, _safe_json(resp))
         return _safe_json(resp) if resp.content else {}
 
-    def _request(self, method: str, url: str, body: dict | None = None) -> dict:
-        if not self.token:
-            self.login()
+    def _request(self, method: str, url: str, body: dict | None = None,
+                 params: dict | None = None, timeout: float | None = None) -> dict:
+        self._ensure_token()
+        tmo = self.timeout if timeout is None else timeout
         headers = {"Authorization": f"Bearer {self.token}"}
-        resp = self.http.request(method, url, json=body, headers=headers,
-                                 timeout=self.timeout)
+        resp = self.http.request(method, url, json=body, params=params, headers=headers,
+                                 timeout=tmo)
         if resp.status_code == 401 and self.token is not None:
             # Token rejected (e.g. after server restart / logout): log in again, retry once.
-            self._clear_token()
-            self.login()
+            self._relogin()
             headers = {"Authorization": f"Bearer {self.token}"}
-            resp = self.http.request(method, url, json=body, headers=headers,
-                                     timeout=self.timeout)
+            resp = self.http.request(method, url, json=body, params=params, headers=headers,
+                                     timeout=tmo)
         if resp.status_code >= 400:
             raise MatrixError(resp.status_code, _safe_json(resp))
         return _safe_json(resp) if resp.content else {}

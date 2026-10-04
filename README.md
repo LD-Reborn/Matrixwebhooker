@@ -76,6 +76,73 @@ Grafana, CI, ... ──HTTP──▶ MatrixWebhooker ──Matrix API──▶ p
    > `MATRIX_HOME_SERVER=http://host.docker.internal:8008` to stay on the
    > LAN instead of public DNS.
 
+## Triggers (incoming messages)
+
+Beyond pushing alerts *into* Matrix, a bot can **react to messages it
+receives**. Add `triggers` to a bot entry in `bots.json`:
+
+```json
+{
+  "bots": [
+    {
+      "name": "grafana_bot",
+      "user": "grafana_bot",
+      "password": "...",
+      "api_key": "...",
+      "room_id": "!...:domain",
+      "triggers": [
+        {
+          "room": "Grafana Bot Alerts",
+          "command": "opencode run -m ollama/qwen3.8:27b-mtp-q4_K_M-128k \"You got a new message in matrix channel {{channel}}: {{msg}}\"",
+          "context": 25
+        },
+        { "room": "!...:domain", "command": ["curl -fsS https://example.local/hook", "logger -t mw 'triggered'"] }
+      ]
+    }
+  ]
+}
+```
+
+- `room` — the channel to listen in: the room's **display name**
+  (case-insensitive) or a **room id** (`!…`). Use a room id for DMs (they
+  have no display name). One bot can have many triggers.
+- `command` — one **bash** command line, or a list of them run in sequence
+  in the app directory. Placeholders are substituted (and shell-quoted, so
+  no injection/quoting worries):
+  - `{{channel}}` — the room's display name (or id if it has none)
+  - `{{msg}}` — the last `context` messages of the room, one per line,
+    newest last, e.g. `[2026-10-04 12:01:22] @user: deploy done`
+  - `{{sender}}` — the sender of the new message
+  - `{{room}}` — the room id
+- `context` — how many messages `{{msg}}` holds (default `25`, max `100`).
+- A trigger fires only for a message **from someone else** — messages the
+  bot itself sent are always skipped (no loops).
+- If a client is **waiting** for that room at the moment (see below), the
+  message goes to the waiting client *instead of* the triggers.
+- Runs in a background thread; long commands (like a full `opencode run`)
+  don't block the watcher. Restart the server after editing `bots.json` to
+  load changes. In the slim Docker image there is no `bash`, so commands
+  fall back to `sh` — keep them POSIX-safe if you run Docker.
+
+### Waiting for a reply
+
+Ask a question and block for the answer instead of firing a trigger:
+
+- **MCP tool** `wait_for_reply(room, bot="", timeout=120)` — blocks up to
+  `timeout` seconds (max 600) for the next message in the room that is not
+  from the bot itself: `{"received": {"sender", "body", "ts", ...}}`, or
+  `{"received": null}` on timeout. Natural pattern for a conversational
+  trigger: the spawned `opencode run` can `send_message` a clarifying
+  question, then `wait_for_reply` for the human's answer — and that answer
+  is handed to it directly, never re-triggering the bot.
+- **HTTP** `POST /wait` with `{"room_id": "!…", "timeout": 120}` — same
+  semantics, auth with the bot's API key (names the bot that waits).
+
+Both are served by the long-lived `server.py` (which owns the watcher and
+the trigger/wait registry), so `wait_for_reply` needs `server.py` running —
+the other MCP tools work without it. `MATRIX_WEBHOOKER_URL` points the tool
+at the server (default `http://localhost:8080`).
+
 ## API
 
 Auth header for every request: `X-API-Key: <api_key of the bot>` (or
@@ -125,10 +192,13 @@ Service status plus per-bot state (`connected`, `room`).
 
 ## MCP server (optional)
 
-The same bot model is exposed as an MCP server (`mcp_server.py`) with four
-tools — `list_bots`, `list_rooms`, `read_messages`, `send_message` — so an
+The same bot model is exposed as an MCP server (`mcp_server.py`) with five
+tools — `list_bots`, `list_rooms`, `read_messages`, `send_message`,
+`wait_for_reply` — so an
 AI assistant can read from and send to your Matrix rooms. It talks to the
-homeserver **directly**, so the HTTP server does not need to be running.
+homeserver **directly**, so the HTTP server does not need to be running —
+*except* `wait_for_reply`, which blocks on a message and is served by
+`server.py` (which owns the triggers); see "Waiting for a reply" above.
 Same config (`.env` + `bots.json`); optional `MCP_BOT` env sets the default
 bot for tool calls without a `bot` argument.
 

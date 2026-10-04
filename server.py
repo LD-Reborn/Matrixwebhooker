@@ -10,13 +10,21 @@ Endpoints:
                 "msgtype": "m.text (default) | m.notice",
                 "html": "optional HTML body",
                 "room_id": "optional override of the bot's default room"}
-    GET  /me         which bot this API key belongs to
+    POST /wait       block for the bot's next message in a room; that message
+                     skips the bot's triggers (body: {"room_id": "!...", "timeout": 120})
+    GET  /me         which bot this API key belongs to (+ its triggers)
     GET  /rooms      the requesting bot's joined rooms (id + name)
     GET  /rooms/<room_id>/messages
                      recent messages of the bot's room (?limit=50, max 100)
     GET  /health     service + per-bot status (no auth)
     GET  /           usage hints (no auth)
 
+
+Message watching / triggers:
+    One watcher thread per bot (triggers.py) long-polls /sync and, for every
+    room message the bot receives (not from itself), either hands it to a
+    client waiting via /wait or fires the bot's configured triggers --
+    bash command line(s) per room with {{channel}}/{{msg}}/{{sender}}/{{room}}.
 Config: ``.env`` (shared settings) + ``bots.json`` (bot roster, secrets).
 """
 
@@ -28,6 +36,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
 from matrixbot import BASE_DIR, Bot, ConfigError, MatrixError, load_settings
+from triggers import MAX_WAIT_SECONDS, MessageWatcher, WaitRegistry
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -38,6 +47,10 @@ except ConfigError as exc:
     sys.exit(2)
 
 BOTS: dict[str, Bot] = {cfg.name: Bot(cfg, settings) for cfg in settings.bots}
+
+#: Pending reply waiters (POST /wait); incoming messages matching a waiter
+#: are delivered there and are NOT fired as triggers.
+WAITERS = WaitRegistry()
 
 app = Flask(__name__)
 
@@ -79,7 +92,15 @@ def index():
                          "html": "optional HTML body",
                          "room_id": "optional override of the bot's default room"},
             },
-            "GET /me": "which bot an API key belongs to",
+            "POST /wait": {
+                "auth": "same API key (names the bot that waits)",
+                "body": {"room_id": "!...:domain",
+                         "timeout": "seconds, default 120, max 600"},
+                "note": "blocks until the next message in that room (not from "
+                        "the bot itself); that message is delivered here and "
+                        "skips the bot's triggers; timeout -> received=null",
+            },
+            "GET /me": "which bot an API key belongs to (with its triggers)",
             "GET /rooms": "the requesting bot's joined rooms",
             "GET /rooms/<room_id>/messages": "recent messages (?limit=50, max 100)",
             "GET /health": "service + per-bot status, no auth",
@@ -103,7 +124,10 @@ def me():
         return jsonify({"error": "unauthorized: send a valid bot API key as "
                                  "X-API-Key (or Authorization: Bearer ...)"}), 401
     return jsonify({"bot": bot.name, "user": bot.user_id,
-                    "room": bot.room_id_cached_or_pinned()})
+                    "room": bot.room_id_cached_or_pinned(),
+                    "triggers": [{"room": t.room, "context": t.context,
+                                  "commands": t.commands}
+                                 for t in bot.cfg.triggers]})
 
 
 @app.get("/rooms")
@@ -168,11 +192,49 @@ def webhook():
                     "event_id": event.get("event_id")})
 
 
+@app.post("/wait")
+def wait_reply():
+    """Block until the bot's next message in a room (or timeout).
+
+    The message is delivered here and is therefore NOT fired through the
+    bot's triggers (see ``triggers.py`` / the MCP ``wait_for_reply`` tool).
+    """
+    bot = _authed_bot()
+    if bot is None:
+        return (jsonify({"error": "unauthorized: send a valid bot API key as "
+                                  "X-API-Key (or Authorization: Bearer ...)"}),
+                401)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "body must be a JSON object"}), 400
+    room_id = str(data.get("room_id") or "").strip()
+    if not room_id.startswith("!"):
+        return jsonify({"error": "'room_id' must be a Matrix room id (!...)"}), 400
+    try:
+        timeout = float(data.get("timeout", 120))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'timeout' must be a number of seconds"}), 400
+    timeout = max(1.0, min(timeout, MAX_WAIT_SECONDS))
+
+    waiter = WAITERS.register(bot.name, room_id)
+    if waiter.event.wait(timeout):
+        return jsonify({"ok": True, "bot": bot.name, "room": room_id,
+                        "received": waiter.message})
+    return jsonify({"ok": True, "bot": bot.name, "room": room_id, "received": None})
+
+
 def main() -> None:
+    watchers: list[MessageWatcher] = []
     for bot in BOTS.values():
+        trig = [t.room for t in bot.cfg.triggers]
         print(f"bot: {bot.name} ({bot.user_id}) "
-              f"room={bot.room_id_cached_or_pinned() or '(resolved on first use)'}")
-    print(f"Webhooker ready: {len(BOTS)} bot(s) on {settings.homeserver}")
+              f"room={bot.room_id_cached_or_pinned() or '(resolved on first use)'} "
+              f"triggers=[{', '.join(trig) or 'none'}]")
+        w = MessageWatcher(bot, WAITERS)
+        w.start()
+        watchers.append(w)
+    print(f"Webhooker ready: {len(BOTS)} bot(s) on {settings.homeserver} "
+          f"({len(watchers)} watcher(s) active)")
     app.run(host=settings.host, port=settings.port, debug=False, threaded=True)
 
 

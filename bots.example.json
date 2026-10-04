@@ -1,5 +1,5 @@
 {
-  "_comment": "Bot roster — one entry per bot account (this file holds secrets: keep it out of git, see bots.json). Generate api_key with: python3 -c 'import secrets; print(secrets.token_urlsafe(24))'",
+  "_comment": "Bot roster — one entry per bot account (this file holds secrets: keep it out of git, see bots.json). Generate api_key with: python3 -c 'import secrets; print(secrets.token_urlsafe(24))'. Optional \"triggers\" fire when the bot receives a message (not from itself) in a matching room; see README 'Triggers'.",
   "bots": [
     {
       "name": "webhook_bot",
@@ -13,7 +13,14 @@
       "name": "grafana_bot",
       "user": "grafana_bot",
       "password": "change-me",
-      "api_key": "change-me"
+      "api_key": "change-me",
+      "triggers": [
+        {
+          "room": "Grafana Bot Alerts",
+          "command": "opencode run -m ollama/qwen3.8:27b-mtp-q4_K_M-128k \"You got a new message in matrix channel {{channel}}: {{msg}}\"",
+          "context": 25
+        }
+      ]
     }
   ]
 }
