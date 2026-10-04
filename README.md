@@ -93,7 +93,7 @@ receives**. Add `triggers` to a bot entry in `bots.json`:
       "triggers": [
         {
           "room": "Grafana Bot Alerts",
-          "command": "opencode run -m ollama/qwen3.8:27b-mtp-q4_K_M-128k \"You got a new message in matrix channel {{channel}}: {{msg}}\"",
+          "command": "opencode run --standalone -m ollama/qwen3.8:27b-mtp-q4_K_M-128k \"You got a new message in matrix channel {{channel}}: {{msg}}\"",
           "context": 25
         },
         { "room": "!...:domain", "command": ["curl -fsS https://example.local/hook", "logger -t mw 'triggered'"] }
@@ -170,6 +170,17 @@ whole rule: a sentence that merely starts with "stop" such as
    (`POST /wait` returns `{"stopped": true, "received": null}`);
 3. removes every wrench reaction it added for that room;
 4. replies with a short confirmation (`⏹ Stopped.` / `⏹ Stop sent …`).
+
+> **`opencode run` triggers need `--standalone`.** Without it, `opencode run`
+> is only a thin client: it submits the job to OpenCode's *shared background
+> service* (`opencode serve --service`) and streams the output. `stop` kills
+> the client's process group and the client dies (`exit -15`), but the shared
+> service keeps the model turn running and will **still post the answer** —
+> and killing the shared service outright would also kill your IDE's session.
+> With `--standalone`, the run executes in its own process tree, so the
+> process-group kill actually stops it. If you use any other long-lived tool
+> as a trigger, make sure it runs the work in-process (not in a shared
+> daemon) or `stop` has the same problem.
 
 ## API
 

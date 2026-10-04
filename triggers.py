@@ -11,7 +11,12 @@ bot receives — any channel it is in, including DMs — in this order:
      execution for that room: the running trigger command is killed, any
      pending waiters (a model blocked in ``wait_for_reply``) are released,
      and every wrench reaction added while it was handled is removed again.
-     The stop command is never delivered to a waiter or fired as a trigger;
+     The stop command is never delivered to a waiter or fired as a trigger.
+     The kill is a signal to the command's *process group*, so the work must
+     actually run inside that process tree: e.g. ``opencode run`` needs
+     ``--standalone`` — without it it is only a client of the shared OpenCode
+     background service, and killing the client would leave that service
+     running the turn (and posting the answer);
   3. if a client is waiting for a reply in that room (``POST /wait``, or
      the MCP ``wait_for_reply`` tool), the message is handed to the oldest
      waiter instead of running any triggers.  While a trigger run for that

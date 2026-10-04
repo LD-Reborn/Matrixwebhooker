@@ -17,7 +17,7 @@
       "triggers": [
         {
           "room": "Grafana Bot Alerts",
-          "command": "opencode run -m ollama/qwen3.8:27b-mtp-q4_K_M-128k \"You got a new message in matrix channel {{channel}}: {{msg}}\"",
+          "command": "opencode run --standalone -m ollama/qwen3.8:27b-mtp-q4_K_M-128k \"You got a new message in matrix channel {{channel}}: {{msg}}\"",
           "context": 25
         }
       ]
