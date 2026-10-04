@@ -76,6 +76,29 @@ Grafana, CI, ... ──HTTP──▶ MatrixWebhooker ──Matrix API──▶ p
    > `MATRIX_HOME_SERVER=http://host.docker.internal:8008` to stay on the
    > LAN instead of public DNS.
 
+   **Or as a systemd service (bare Linux, no Docker):** run the one-time
+   deploy script once — it sets up a virtualenv, installs
+   `/etc/systemd/system/matrix-webhooker.service`, then enables and starts
+   it (same `restart: unless-stopped` semantics as above):
+
+   ```sh
+   sudo bash linux_systemd_deploy.sh
+   systemctl status matrix-webhooker
+   journalctl -u matrix-webhooker -f        # follow logs
+   ```
+
+   It runs `server.py` directly as the deploying user (so trigger commands
+   like `opencode run` work outside Docker) with the working directory set
+   to the app directory — `.env` and `bots.json` are picked up from there.
+   The unit's `PATH` puts `~/.local/bin` and `~/.opencode/bin` ahead of
+   `/usr/bin`, so trigger commands pick up user-installed tool versions.
+   Re-running the script while the service is running applies the updated
+   unit and **restarts** the service (a bare `enable --now` on an already
+   running unit would leave the old process in place).
+   To pick up `bots.json` / `.env` / code changes: `systemctl restart matrix-webhooker`.
+   Uninstall: `systemctl disable --now matrix-webhooker
+   && rm -f /etc/systemd/system/matrix-webhooker.service`.
+
 ## Triggers (incoming messages)
 
 Beyond pushing alerts *into* Matrix, a bot can **react to messages it
@@ -114,6 +137,16 @@ receives**. Add `triggers` to a bot entry in `bots.json`:
     newest last, e.g. `[2026-10-04 12:01:22] @user: deploy done`
   - `{{sender}}` — the sender of the new message
   - `{{room}}` — the room id
+  - `{{message_file}}` — a fresh per-run JSON file with the new message
+    (sender, ts, body, room)
+  - `{{history_file}}` — a fresh per-run JSON file with the last `context`
+    messages, oldest first / newest last (same content as `{{msg}}`, structured)
+
+  The command line is executed by `bash`, so keep the literal text
+  shell-safe: no unquoted `;`, `|`, `&`, `(`, `$`, quotes, … Placeholders
+  are shell-quoted automatically. For dynamic content, prefer the file
+  placeholders — programs read `message.json` / `history.json` from disk
+  (removed when the run finishes) instead of parsing the command line.
 - `context` — how many messages `{{msg}}` holds (default `25`, max `100`).
 - A trigger fires only for a message **from someone else** — messages the
   bot itself sent are always skipped (no loops).

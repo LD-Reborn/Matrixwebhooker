@@ -24,10 +24,13 @@ bot receives — any channel it is in, including DMs — in this order:
      with the wrench reaction (see below);
   4. otherwise every trigger of the bot whose room matches is fired in a
      background thread: the bash command line(s) with ``{{channel}}``,
-     ``{{msg}}`` (last ``context`` messages, newest last), ``{{sender}}``
-     and ``{{room}}`` placeholders (values are shell-quoted), run in the
-     app directory with ``bash`` (falls back to ``sh`` if no bash, e.g. in
-     the slim Docker image).
+     ``{{msg}}`` (last ``context`` messages, newest last), ``{{sender}}``,
+     ``{{room}}``, ``{{message_file}}`` and ``{{history_file}}``
+     placeholders (values are shell-quoted), run in the app directory with
+     ``bash`` (falls back to ``sh`` if no bash, e.g. in the slim Docker
+     image).  The file placeholders point at JSON files (fresh per run,
+     removed after the command(s) exit) so dynamic content can be handed to
+     a program without any shell-quoting issues.
 
 Wrench feedback (🔧):
     Whenever a message is *handled* — a trigger for its room is fired, or it
@@ -45,6 +48,7 @@ suppression always live in exactly one process (no double-firing).
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -52,6 +56,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -170,6 +175,63 @@ def format_history(messages: list[dict]) -> str:
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts / 1000)) if ts else "?"
         lines.append(f"[{when}] {sender}: {body}")
     return "\n".join(lines)
+
+
+#: Per-run JSON context lives here (one sub-directory per fired trigger).
+CONTEXT_DIR = BASE_DIR / ".trigger-context"
+
+#: Context directories older than this are removed on the next trigger fire
+#: (covers runs that were killed and never got a chance to clean up).
+CONTEXT_TTL_SECONDS = 24 * 3600
+
+
+def _sweep_stale_context() -> None:
+    try:
+        for entry in CONTEXT_DIR.iterdir():
+            try:
+                if time.time() - entry.stat().st_mtime > CONTEXT_TTL_SECONDS:
+                    shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                pass
+    except OSError:  # directory missing: nothing to sweep
+        pass
+
+
+def write_context_files(room_id: str, room_name: str | None, ev: dict,
+                        history: list[dict]) -> tuple[str, str]:
+    """Write this message and the recent room history as JSON into a fresh
+    per-run directory and return ``(message_file, history_file)``.
+
+    ``message.json``  — the triggering message (raw body).
+    ``history.json``  — the last ``context`` messages, oldest first, newest
+                        last (the same content ``{{msg}}`` renders, structured).
+
+    Files are 0600, the directory 0700 (/tmp-backed tools aside, this may sit
+    inside the app directory, see CONTEXT_DIR).
+    """
+    _sweep_stale_context()
+    CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+    run_dir = tempfile.mkdtemp(prefix="trig-", dir=str(CONTEXT_DIR))
+    common = {"room_id": room_id, "channel": room_name or room_id}
+    payloads = {
+        "message.json": {**common,
+                         "sender": ev.get("sender"),
+                         "ts": ev.get("ts"),
+                         "body": ev.get("body")},
+        "history.json": {**common,
+                         "oldest_first": True,
+                         "messages": [{"ts": m.get("ts"),
+                                       "sender": m.get("sender"),
+                                       "body": m.get("body")}
+                                      for m in history]},
+    }
+    for name, payload in payloads.items():
+        path = os.path.join(run_dir, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+        os.chmod(path, 0o600)
+    return (os.path.join(run_dir, "message.json"),
+            os.path.join(run_dir, "history.json"))
 
 
 def render(template: str, values: dict[str, str]) -> str:
@@ -469,6 +531,10 @@ class MessageWatcher:
             "sender": ev.get("sender") or "",
             "msg": format_history(history),
         }
+        # JSON files for the command(s) to read ({{message_file}} /
+        # {{history_file}}) — dynamic content stays out of the shell line.
+        values["message_file"], values["history_file"] = write_context_files(
+            room_id, room_name, ev, history)
         env = dict(
             os.environ,
             MATRIX_BOT=self.bot.name,
@@ -513,3 +579,5 @@ class MessageWatcher:
                 _log(f"{tag} exit {proc.returncode} after {dt:.1f}s: {tail}")
         if sess.cancelled:
             _log(f"{tag} stopped by user command")
+        # The command(s) are done; their context files are no longer needed.
+        shutil.rmtree(os.path.dirname(values["message_file"]), ignore_errors=True)
