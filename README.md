@@ -143,6 +143,34 @@ the trigger/wait registry), so `wait_for_reply` needs `server.py` running —
 the other MCP tools work without it. `MATRIX_WEBHOOKER_URL` points the tool
 at the server (default `http://localhost:8080`).
 
+### Wrench feedback (🔧)
+
+While the bot is **handling** a message it reacts to it with the wrench
+emoji, and removes the reaction again as soon as that handling is done:
+
+- a message that **fires a trigger** gets 🔧 as soon as the command starts;
+- a message **delivered to a model that is waiting** (`wait_for_reply`) also
+  gets 🔧 while the run it belongs to is still in flight.
+
+The wrench is removed (the reaction event is redacted) when the trigger
+command(s) finish, the run is stopped, or the room's pending wait is
+released — so in the room you can always tell which messages the bot is
+still working on.
+
+### Stopping a run
+
+To interrupt the current execution in a room, just send a bare **`stop`**
+(any capitalization, optional leading `/`, trailing punctuation is fine —
+`stop`, `/stop`, `STOP`, `STOP!!!`). It contains no whitespace, which is the
+whole rule: a sentence that merely starts with "stop" such as
+`stop ollama.service` is a normal message, *not* a stop. On `stop` the bot:
+
+1. kills the running trigger command (SIGTERM the process group, then SIGKILL);
+2. releases any model blocked in `wait_for_reply` for that room
+   (`POST /wait` returns `{"stopped": true, "received": null}`);
+3. removes every wrench reaction it added for that room;
+4. replies with a short confirmation (`⏹ Stopped.` / `⏹ Stop sent …`).
+
 ## API
 
 Auth header for every request: `X-API-Key: <api_key of the bot>` (or
@@ -192,10 +220,12 @@ Service status plus per-bot state (`connected`, `room`).
 
 ## MCP server (optional)
 
-The same bot model is exposed as an MCP server (`mcp_server.py`) with five
-tools — `list_bots`, `list_rooms`, `read_messages`, `send_message`,
+The same bot model is exposed as an MCP server (`mcp_server.py`) with six
+tools — `list_bots`, `list_rooms`, `read_messages`, `send_message`, `react`,
 `wait_for_reply` — so an
-AI assistant can read from and send to your Matrix rooms. It talks to the
+AI assistant can read from and send to your Matrix rooms. `react(event_id,
+key, room)` adds an emoji reaction to a specific message (e.g. `key="✅"`),
+using the `event_id` returned by `read_messages`. It talks to the
 homeserver **directly**, so the HTTP server does not need to be running —
 *except* `wait_for_reply`, which blocks on a message and is served by
 `server.py` (which owns the triggers); see "Waiting for a reply" above.

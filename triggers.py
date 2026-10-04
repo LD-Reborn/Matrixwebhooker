@@ -6,15 +6,32 @@ thread per bot long-polls Matrix ``/sync`` and, for every room message the
 bot receives — any channel it is in, including DMs — in this order:
 
   1. messages sent by the bot itself are ignored (never a trigger);
-  2. if a client is waiting for a reply in that room (``POST /wait``, or
+  2. a bare "stop" keyword (``stop`` / ``/stop`` / ``STOP`` / ``STOP!!!`` —
+     starts with "stop" and contains no whitespace) halts the current
+     execution for that room: the running trigger command is killed, any
+     pending waiters (a model blocked in ``wait_for_reply``) are released,
+     and every wrench reaction added while it was handled is removed again.
+     The stop command is never delivered to a waiter or fired as a trigger;
+  3. if a client is waiting for a reply in that room (``POST /wait``, or
      the MCP ``wait_for_reply`` tool), the message is handed to the oldest
-     waiter instead of running any triggers;
-  3. otherwise every trigger of the bot whose room matches is fired in a
+     waiter instead of running any triggers.  While a trigger run for that
+     room is still in flight, the delivered message is additionally marked
+     with the wrench reaction (see below);
+  4. otherwise every trigger of the bot whose room matches is fired in a
      background thread: the bash command line(s) with ``{{channel}}``,
      ``{{msg}}`` (last ``context`` messages, newest last), ``{{sender}}``
      and ``{{room}}`` placeholders (values are shell-quoted), run in the
      app directory with ``bash`` (falls back to ``sh`` if no bash, e.g. in
      the slim Docker image).
+
+Wrench feedback (🔧):
+    Whenever a message is *handled* — a trigger for its room is fired, or it
+    is delivered to a model that is already waiting for a reply in that room
+    while that trigger run is still in flight — the bot reacts to it with the
+    wrench emoji ``🔧``.  As soon as handling of that message is finished
+    (the trigger command(s) exit, or the room's "stop" command is received),
+    the reaction is removed again (the reaction event is redacted), so you
+    can tell at a glance which messages the bot is still working on.
 
 ``mcp_server.py`` deliberately runs no watcher of its own: its
 ``wait_for_reply`` tool talks to this server, so waits and trigger
@@ -24,8 +41,10 @@ suppression always live in exactly one process (no double-firing).
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -37,9 +56,30 @@ from matrixbot import BASE_DIR, Bot, MatrixError
 #: Hard cap (seconds) for POST /wait and the MCP wait_for_reply tool.
 MAX_WAIT_SECONDS = 600
 
+#: The reaction the bot adds to a message while it is being handled, and
+#: removes again as soon as handling of that message is over.
+WRENCH_REACTION = "🔧"
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+def is_stop_command(body: str | None) -> bool:
+    """True for a bare ``stop`` keyword — and nothing else.
+
+    Matches exactly the word ``stop`` (ignoring case, an optional leading
+    ``/``, and trailing punctuation like ``!?.``), with no whitespace:
+    ``stop`` / ``/stop`` / ``STOP`` / ``STOP!!!`` / ``sTop?`` all match, but
+    a sentence such as ``stop ollama.service`` and a different word such as
+    ``stopped`` do not.
+    """
+    if not body:
+        return False
+    text = body.strip()
+    if not text or re.search(r"\s", text):
+        return False
+    return text.casefold().lstrip("/").rstrip("!?.…:;") == "stop"
 
 
 # ---------------------------------------------------------------------------
@@ -48,11 +88,12 @@ def _log(msg: str) -> None:
 
 
 class _Waiter:
-    __slots__ = ("event", "message")
+    __slots__ = ("event", "message", "stopped")
 
     def __init__(self) -> None:
         self.event = threading.Event()
         self.message: dict | None = None
+        self.stopped = False
 
 
 class WaitRegistry:
@@ -89,6 +130,25 @@ class WaitRegistry:
             waiter.event.set()
         return True
 
+    def cancel(self, bot_name: str, room_id: str) -> int:
+        """Release and drop every pending waiter of that bot+room (stop).
+
+        Each waiter is unblocked immediately with ``stopped = True`` and
+        ``message = None`` so the waiting ``/wait`` / ``wait_for_reply``
+        client returns right away. Returns how many waiters were released.
+        """
+        key = self._key(bot_name, room_id)
+        with self._lock:
+            queue = self._queues.get(key)
+            waiters = list(queue) if queue else []
+            if queue:
+                queue.clear()
+        for w in waiters:
+            if w.message is None:
+                w.stopped = True
+                w.event.set()
+        return len(waiters)
+
 
 # ---------------------------------------------------------------------------
 # Trigger rendering
@@ -119,9 +179,35 @@ def _shell_prefix() -> list[str]:
     return ["bash", "-c"] if shutil.which("bash") else ["sh", "-c"]
 
 
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+    """Signal the whole process group of ``proc`` (it was started with its own
+    session), so we also reach the children of ``bash -c`` (e.g. ``opencode``)."""
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except (ProcessLookupError, PermissionError) as exc:
+        _log(f"  killpg(pid={proc.pid}, sig={sig!r}) failed: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Per-bot watcher
 # ---------------------------------------------------------------------------
+
+
+class _Session:
+    """One in-flight run of a bot's triggers in a single room: the command
+    process(es) currently running, the wrench-reaction events added on the
+    room's behalf while it runs, and its state.  Wrench removal happens
+    exactly once (whichever of the run's end / a stop claim wins it via
+    ``cleaned``)."""
+
+    __slots__ = ("room_id", "procs", "reactions", "cancelled", "cleaned")
+
+    def __init__(self, room_id: str) -> None:
+        self.room_id = room_id
+        self.procs: list[subprocess.Popen] = []
+        self.reactions: list[str] = []
+        self.cancelled = False
+        self.cleaned = False
 
 
 class MessageWatcher:
@@ -139,6 +225,10 @@ class MessageWatcher:
         # unchanged state, so names learned from the initial snapshot (or
         # the state API) are kept here for trigger matching.
         self._room_names: dict[str, str] = {}
+        # In-flight runs (casefolded room_id -> active sessions).  Guarded by
+        # _session_lock; shared with the stop path and the wrench bookkeeping.
+        self._session_lock = threading.Lock()
+        self._sessions: dict[str, list[_Session]] = {}
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run,
@@ -205,6 +295,91 @@ class MessageWatcher:
         for ev in result["events"]:
             self._handle(ev)
 
+    # -- wrench reactions -----------------------------------------------------
+
+    def _react_on(self, room_id: str, event_id: str) -> str | None:
+        """Add the wrench emoji to ``event_id``.
+
+        Returns the reaction's own event id (for redacting it later), or None
+        if there was nothing to react to / the reaction failed.
+        """
+        if not event_id:
+            return None
+        try:
+            return self.bot.client.react(room_id, event_id, WRENCH_REACTION)
+        except MatrixError as exc:
+            _log(f"{self.tag} adding wrench to {event_id} failed: {exc}")
+            return None
+
+    def _unreact(self, room_id: str, reaction_id: str) -> None:
+        try:
+            self.bot.client.unreact(room_id, reaction_id)
+        except MatrixError as exc:
+            _log(f"{self.tag} removing wrench ({reaction_id}) failed: {exc}")
+
+    def _clean_up(self, sess: _Session) -> None:
+        """Atomically claim this session's wrench removal (happens exactly once)
+        and redact every wrench we added for it."""
+        with self._session_lock:
+            if sess.cleaned:
+                return
+            sess.cleaned = True
+            my_reactions = list(sess.reactions)
+        for rid in my_reactions:
+            self._unreact(sess.room_id, rid)
+        if my_reactions:
+            _log(f"{self.tag} wrench removed from {len(my_reactions)} message(s)")
+
+    # -- stop keyword ---------------------------------------------------------
+
+    def _kill_running(self, sess: _Session) -> None:
+        """Terminate the session's still-running command(s): SIGTERM the whole
+        process group, wait briefly, then SIGKILL survivors."""
+        with self._session_lock:
+            procs = [p for p in sess.procs if p.poll() is None]
+        if not procs:
+            return
+        for p in procs:
+            _signal_group(p, signal.SIGTERM)
+        deadline = time.monotonic() + 3.0
+        for p in procs:
+            try:
+                p.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                _signal_group(p, signal.SIGKILL)
+                try:
+                    p.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    _log(f"{self.tag} pid {p.pid} did not die")
+
+    def _ack_stop(self, room_id: str, message: str) -> None:
+        try:
+            self.bot.client.send_message(room_id,
+                                         {"msgtype": "m.text", "body": message})
+        except MatrixError as exc:
+            _log(f"{self.tag} sending stop acknowledgment failed: {exc}")
+
+    def _stop_room(self, room_id: str, where: str) -> None:
+        """Handle a bare "stop" in ``room_id``: kill the run, release waiters
+        and clean up the wrench reactions."""
+        key = room_id.casefold()
+        with self._session_lock:
+            active = list(self._sessions.get(key, []))
+        for sess in active:
+            sess.cancelled = True
+            self._kill_running(sess)
+            self._clean_up(sess)
+        cancelled = self.waiters.cancel(self.bot.name, room_id)
+        if active:
+            ack = "⏹ Stopped."
+        elif cancelled:
+            ack = "⏹ Stop sent (waiting model released)."
+        else:
+            ack = "⏹ Nothing was running."
+        self._ack_stop(room_id, ack)
+        _log(f"{self.tag} {where} -> stopped: {len(active)} run(s), "
+             f"{cancelled} waiter(s) released")
+
     # -- per-message pipeline ---------------------------------------------------
 
     def _handle(self, ev: dict) -> None:
@@ -213,10 +388,28 @@ class MessageWatcher:
         room_id = ev["room_id"]
         room_name = self._name_for(room_id, ev.get("room_name"))
         where = f"room={room_name or room_id}"
+
+        if is_stop_command(ev.get("body")):
+            self._stop_room(room_id, where)
+            return
+
         if self.waiters.deliver(self.bot.name, room_id, ev):
+            # Delivered to a model that is waiting for a reply.  If there is a
+            # run in flight for this room, mark this message as being handled
+            # too (its wrench is removed when that run finishes / is stopped).
+            key = room_id.casefold()
+            with self._session_lock:
+                live = self._sessions.get(key)
+                target = live[0] if live else None
+            if target is not None:
+                rid = self._react_on(room_id, ev.get("event_id"))
+                if rid:
+                    with self._session_lock:
+                        target.reactions.append(rid)
             _log(f"{self.tag} {where} sender={ev.get('sender')} "
                  f"-> delivered to waiting client (triggers suppressed)")
             return
+
         for trig in self.bot.cfg.triggers:
             if not trig.matches(room_id, room_name):
                 continue
@@ -231,6 +424,30 @@ class MessageWatcher:
     def _fire(self, trig, ev: dict) -> None:
         tag = f"[trigger:{self.bot.name}:{trig.room}]"
         room_id = ev["room_id"]
+        key = room_id.casefold()
+
+        sess = _Session(room_id)
+        with self._session_lock:
+            self._sessions.setdefault(key, []).append(sess)
+
+        # Mark the triggering message as being handled.
+        rid = self._react_on(room_id, ev.get("event_id"))
+        if rid:
+            with self._session_lock:
+                sess.reactions.append(rid)
+
+        try:
+            self._run_commands(tag, trig, sess, room_id, ev)
+        finally:
+            with self._session_lock:
+                live = self._sessions.get(key)
+                if live and sess in live:
+                    live.remove(sess)
+            self._clean_up(sess)
+            _log(f"{tag} run finished for {room_id}")
+
+    def _run_commands(self, tag: str, trig, sess: _Session,
+                      room_id: str, ev: dict) -> None:
         room_name = ev.get("room_name")
         try:
             history = self.bot.client.read_messages(room_id, limit=trig.context)
@@ -257,18 +474,37 @@ class MessageWatcher:
         )
         prefix = _shell_prefix()
         for command in trig.commands:
+            if sess.cancelled:
+                _log(f"{tag} cancelled before command: {command[:80]}")
+                break
             cmdline = render(command, values)
             _log(f"{tag} run: {cmdline[:300]}")
             started = time.monotonic()
             try:
-                proc = subprocess.run(prefix + [cmdline], env=env, cwd=str(BASE_DIR),
-                                      capture_output=True, text=True)
+                proc = subprocess.Popen(prefix + [cmdline], env=env, cwd=str(BASE_DIR),
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True, start_new_session=True)
             except Exception as exc:  # noqa: BLE001
                 _log(f"{tag} failed to start: {exc!r}")
                 continue
+            with self._session_lock:
+                sess.procs.append(proc)
+            try:
+                out, err = proc.communicate()
+            except Exception as exc:  # noqa: BLE001
+                out, err = "", ""
+                _log(f"{tag} error while reaping command: {exc!r}")
+            finally:
+                with self._session_lock:
+                    try:
+                        sess.procs.remove(proc)
+                    except ValueError:
+                        pass
             dt = time.monotonic() - started
             if proc.returncode == 0:
                 _log(f"{tag} done (exit 0, {dt:.1f}s)")
             else:
-                tail = ((proc.stderr or proc.stdout or "") + "\n").strip()[-500:]
+                tail = ((str(err or out) or "") + "\n").strip()[-500:]
                 _log(f"{tag} exit {proc.returncode} after {dt:.1f}s: {tail}")
+        if sess.cancelled:
+            _log(f"{tag} stopped by user command")

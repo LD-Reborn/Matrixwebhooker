@@ -22,9 +22,16 @@ Endpoints:
 
 Message watching / triggers:
     One watcher thread per bot (triggers.py) long-polls /sync and, for every
-    room message the bot receives (not from itself), either hands it to a
-    client waiting via /wait or fires the bot's configured triggers --
-    bash command line(s) per room with {{channel}}/{{msg}}/{{sender}}/{{room}}.
+    room message the bot receives (not from itself):
+      * a bare "stop" keyword (stop / /stop / STOP / STOP!!! -- starts with
+        "stop", no whitespace) stops the current execution for that room:
+        kills the running trigger command, releases waiting models, removes
+        the wrench reactions, and replies with a short confirmation;
+      * otherwise it either hands the message to a client waiting via /wait,
+        or fires the bot's configured triggers -- bash command line(s) per
+        room with {{channel}}/{{msg}}/{{sender}}/{{room}}.
+    While a message is being handled the bot reacts to it with 🔧 and
+    removes that reaction again as soon as handling is finished.
 Config: ``.env`` (shared settings) + ``bots.json`` (bot roster, secrets).
 """
 
@@ -98,7 +105,8 @@ def index():
                          "timeout": "seconds, default 120, max 600"},
                 "note": "blocks until the next message in that room (not from "
                         "the bot itself); that message is delivered here and "
-                        "skips the bot's triggers; timeout -> received=null",
+                        "skips the bot's triggers; timeout -> received=null; "
+                        "stopped=true if a 'stop' command released it first",
             },
             "GET /me": "which bot an API key belongs to (with its triggers)",
             "GET /rooms": "the requesting bot's joined rooms",
@@ -219,8 +227,9 @@ def wait_reply():
     waiter = WAITERS.register(bot.name, room_id)
     if waiter.event.wait(timeout):
         return jsonify({"ok": True, "bot": bot.name, "room": room_id,
-                        "received": waiter.message})
-    return jsonify({"ok": True, "bot": bot.name, "room": room_id, "received": None})
+                        "received": waiter.message, "stopped": waiter.stopped})
+    return jsonify({"ok": True, "bot": bot.name, "room": room_id,
+                    "received": None, "stopped": False})
 
 
 def main() -> None:

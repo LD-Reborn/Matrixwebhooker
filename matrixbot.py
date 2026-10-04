@@ -434,6 +434,40 @@ class Matrix:
                     continue
                 raise
 
+    def react(self, room_id: str, target_event_id: str, key: str) -> str | None:
+        """Add an emoji reaction (``m.annotation`` relation) to ``target_event_id``.
+
+        ``key`` is the emoji (e.g. ``"🔧"``, ``"✅"``). Returns the id of the
+        reaction event (needed to redact/remove it later) or ``None``.
+        """
+        if not key:
+            raise ValueError("reaction 'key' (the emoji) is required")
+        payload = {"m.relates_to": {
+            "rel_type": "m.annotation",
+            "event_id": target_event_id,
+            "key": key,
+        }}
+        for attempt in (1, 2):
+            txn = f"whk-{secrets.token_hex(8)}"
+            url = (f"{self.hs}/_matrix/client/v3/rooms/{quote(room_id)}/"
+                   f"send/m.reaction/{txn}")
+            try:
+                data = self._request("PUT", url, payload)
+            except MatrixError as exc:
+                if (exc.status == 403 and attempt != 2
+                        and "not in the room" in str(exc.payload).lower()):
+                    self.join(room_id)
+                    continue
+                raise
+            return data.get("event_id")
+
+    def unreact(self, room_id: str, reaction_event_id: str) -> None:
+        """Remove a reaction by redacting the reaction event it produced."""
+        txn = f"whk-{secrets.token_hex(8)}"
+        url = (f"{self.hs}/_matrix/client/v3/rooms/{quote(room_id, safe='')}/"
+               f"redact/{quote(reaction_event_id, safe='')}/{txn}")
+        self._request("PUT", url, {})
+
     def join(self, room_id: str) -> None:
         self._request("POST", f"{self.hs}/_matrix/client/v3/rooms/{quote(room_id)}/join")
 

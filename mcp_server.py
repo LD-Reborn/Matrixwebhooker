@@ -11,6 +11,7 @@ Tools:
     list_rooms       the bot's joined rooms (id + name)
     read_messages    recent messages of a room
     send_message     send a message (m.text / m.notice, optional HTML)
+    react            add an emoji reaction to a specific message
     wait_for_reply   block for the next message in a room (that message is
                      delivered to you and skips the bot's configured triggers)
 
@@ -143,6 +144,35 @@ def send_message(text: str, bot: str = "", room: str = "",
         raise ValueError(f"matrix send failed: {exc}") from exc
     return {"ok": True, "bot": b.name, "room": room_id,
             "event_id": event.get("event_id")}
+
+
+@mcp.tool()
+def react(event_id: str, key: str, room: str = "", bot: str = "") -> dict:
+    """React with an emoji to a specific message.
+
+    `event_id`: the "$..." id of the message to react to (see the id returned
+    by read_messages). `key`: the emoji to add, e.g. "🔧", "✅" or "👍".
+    `room`: the room id (!...) the message lives in.
+    Returns the id of the reaction event (you can keep it to reference later).
+    Note: Matrix has no simple "remove by emoji + message" call, so this tool
+    only *adds* a reaction; the "wrench while handled" removal is done
+    automatically by the watcher itself."""
+    b = _resolve_bot(bot)
+    room = room.strip()
+    if not room.startswith("!"):
+        raise ValueError("'room' must be a Matrix room id (!...) — use list_rooms first")
+    event_id = event_id.strip()
+    if not event_id.startswith("$"):
+        raise ValueError("'event_id' must be a Matrix event id ($...) — see read_messages")
+    key = key.strip()
+    if not key:
+        raise ValueError("'key' (the emoji) must be a non-empty string")
+    try:
+        reaction_event_id = b.client.react(room, event_id, key)
+    except MatrixError as exc:
+        raise ValueError(f"matrix react failed: {exc}") from exc
+    return {"ok": True, "bot": b.name, "room": room, "event_id": event_id,
+            "key": key, "reaction_event_id": reaction_event_id}
 
 
 @mcp.tool()
