@@ -27,6 +27,8 @@ from urllib.parse import quote, urlsplit
 
 import requests
 
+from crypto import BotCrypto, CryptoError
+
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -328,17 +330,29 @@ class Matrix:
             rooms.append({"room_id": rid, "name": name})
         return rooms
 
-    def read_messages(self, room_id: str, limit: int = 50) -> list[dict]:
-        """Last ``limit`` room events of type m.room.message, oldest first."""
+    def read_messages(self, room_id: str, limit: int = 50,
+                      crypto: BotCrypto | None = None) -> list[dict]:
+        """Last ``limit`` room events of type m.room.message, oldest first.
+
+        Encrypted events are decrypted when ``crypto`` is given; events that
+        cannot be decrypted are skipped.
+        """
         limit = max(1, min(int(limit), 100))
         data = self._request("GET", f"{self.hs}/_matrix/client/v3/rooms/"
                                     f"{quote(room_id, safe='')}"
                                     f"/messages?dir=b&limit={limit}")
         out = []
         for ev in reversed(data.get("chunk", [])):
-            if ev.get("type") != "m.room.message":
+            etype = ev.get("type")
+            if etype == "m.room.message":
+                content = ev.get("content", {})
+            elif etype == "m.room.encrypted" and crypto is not None:
+                try:
+                    content = crypto.decrypt_room_content(ev.get("content", {}))
+                except CryptoError:
+                    continue
+            else:
                 continue
-            content = ev.get("content", {})
             body = content.get("body")
             if not isinstance(body, str):
                 continue
@@ -354,18 +368,22 @@ class Matrix:
     def sync(self, since: str | None = None, timeout_ms: int = 30000) -> dict:
         """One (long-polling) /sync round trip.
 
-        Returns ``{"next_batch": <token for the next call>, "events": [...]}``
-        where events are the *new* m.room.message events of the joined rooms
-        (oldest first, per room), each with ``room_id``, ``room_name``,
-        ``event_id``, ``sender``, ``msgtype``, ``body`` and ``ts``.
-        A call without ``since`` is a snapshot: its events are historical
-        and the caller must not act on them.
+        Returns ``{"next_batch": ..., "events": [...], "to_device": [...]}``.
+        Events are the *new* m.room.message / m.room.encrypted events of the
+        joined rooms (oldest first, per room), each with ``room_id``,
+        ``room_name``, ``event_id``, ``sender``, ``ts`` and, for plaintext
+        ones, ``msgtype``/``body``; encrypted ones carry ``raw`` (Megolm
+        material) for decryption by ``Bot.crypto``. ``to_device`` holds the
+        raw to-device events (Olm/Megolm key material). A call without
+        ``since`` is a snapshot: its events are historical and the caller
+        must not act on them.
         """
         flt = json.dumps(
             {"room": {
-                "timeline": {"types": ["m.room.message"], "limit": 100},
+                "timeline": {"types": ["m.room.message", "m.room.encrypted"], "limit": 100},
                 "state": {"types": ["m.room.name", "m.room.canonical_alias"]},
-            }},
+            },
+             "to_device": {"types": ["*"]}},
             separators=(",", ":"))
         params: dict[str, str] = {
             "timeout": str(max(0, min(int(timeout_ms), 30000))),
@@ -389,22 +407,39 @@ class Matrix:
                             or (se.get("content") or {}).get("body")
                         break
             for ev in (rdata.get("timeline", {}) or {}).get("events", []) or []:
-                if ev.get("type") != "m.room.message":
+                etype = ev.get("type")
+                if etype not in ("m.room.message", "m.room.encrypted"):
                     continue
                 content = ev.get("content", {})
-                body = content.get("body")
-                if not isinstance(body, str):
-                    continue
-                events.append({
+                entry = {
                     "room_id": room_id,
                     "room_name": name,
                     "event_id": ev.get("event_id"),
                     "sender": ev.get("sender"),
-                    "msgtype": content.get("msgtype", "m.text"),
-                    "body": body,
                     "ts": ev.get("origin_server_ts"),
-                })
-        return {"next_batch": data.get("next_batch"), "events": events}
+                }
+                if etype == "m.room.encrypted":
+                    # Decrypted by the caller (Bot.crypto); the ciphertext
+                    # material is carried along so decryption happens once.
+                    entry["event_type"] = "m.room.encrypted"
+                    entry["raw"] = {
+                        "sender_key": content.get("sender_key"),
+                        "session_id": content.get("session_id"),
+                        "ciphertext": content.get("ciphertext"),
+                    }
+                else:
+                    body = content.get("body")
+                    if not isinstance(body, str):
+                        continue
+                    entry["event_type"] = "m.room.message"
+                    entry["msgtype"] = content.get("msgtype", "m.text")
+                    entry["body"] = body
+                events.append(entry)
+        return {
+            "next_batch": data.get("next_batch"),
+            "events": events,
+            "to_device": (data.get("to_device", {}) or {}).get("events", []),
+        }
 
     def get_room_name(self, room_id: str) -> str | None:
         """Current m.room.name of the room (None if it has no name / no access)."""
@@ -525,10 +560,21 @@ class Bot:
         state_dir = settings.state_dir / cfg.name
         state_dir.mkdir(parents=True, exist_ok=True)
         self.client = Matrix(settings.homeserver, cfg.user, cfg.password, state_dir)
+        self._crypto: BotCrypto | None = None
 
     @property
     def name(self) -> str:
         return self.cfg.name
+
+    @property
+    def crypto(self) -> BotCrypto:
+        """E2E decryption support (lazy; device keys uploaded on first use)."""
+        if self._crypto is None:
+            self._crypto = BotCrypto(
+                self.client, self.client.state_dir,
+                on_log=lambda msg: print(f"[crypto:{self.name}] {msg}",
+                                        file=sys.stderr))
+        return self._crypto
 
     @property
     def user_id(self) -> str:

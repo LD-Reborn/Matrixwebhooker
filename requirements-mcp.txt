@@ -1,4 +1,6 @@
 # For the MCP server (mcp_server.py). The HTTP server needs requirements.txt.
 requests>=2.31
 python-dotenv>=1.0
-mcp>=1.2
+mcp>=1.2,<2
+# E2E decryption (matrixbot crypto support)
+python-olm==3.2.16

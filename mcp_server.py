@@ -116,7 +116,7 @@ def read_messages(room: str, bot: str = "", limit: int = 50) -> dict:
     b = _resolve_bot(bot)
     limit = max(1, min(int(limit), 100))
     try:
-        messages = b.client.read_messages(room, limit=limit)
+        messages = b.client.read_messages(room, limit=limit, crypto=b.crypto)
     except MatrixError as exc:
         raise ValueError(f"matrix read failed: {exc}") from exc
     return {"bot": b.name, "room": room, "messages": messages}

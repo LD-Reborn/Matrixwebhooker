@@ -1,7 +1,10 @@
 .env
 bots.json
+local_secrets.json
 .token
 .room_id
+bot/
+.trigger-context/
 __pycache__/
 *.pyc
 .venv/

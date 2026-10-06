@@ -91,7 +91,7 @@ Group=$RUN_GROUP
 UMask=0027
 WorkingDirectory=$APP_DIR
 Environment=HOME=$RUN_HOME
-Environment=PATH=$RUN_HOME/.local/bin:$RUN_HOME/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=$RUN_HOME/.local/bin:$RUN_HOME/.opencode/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$PY_BIN $APP_DIR/server.py
 Restart=always
 RestartSec=3

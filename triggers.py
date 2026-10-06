@@ -60,7 +60,9 @@ import tempfile
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
+from crypto import CryptoError
 from matrixbot import BASE_DIR, Bot, MatrixError
 
 #: Hard cap (seconds) for POST /wait and the MCP wait_for_reply tool.
@@ -296,8 +298,148 @@ class MessageWatcher:
         # _session_lock; shared with the stop path and the wrench bookkeeping.
         self._session_lock = threading.Lock()
         self._sessions: dict[str, list[_Session]] = {}
+        # Events that arrived E2E-encrypted but could not be decrypted (the
+        # sender's group key has not been shared with us yet).  Keyed by
+        # "room_id|sender_key|session_id"; each entry keeps the undecryptable
+        # events plus the state of the room-key requests we have sent.  On
+        # every sync round — as soon as the key lands via to-device — the
+        # events are decrypted again and flow through the normal pipeline.
+        # Persisted (state dir) so a restart does not forget them.
+        self._key_pending: dict[str, dict] = {}
+        self._pending_file = Path(self.bot.client.state_dir) / "key_pending.json"
+
+    def _load_key_pending(self) -> None:
+        try:
+            data = json.loads(self._pending_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        self._key_pending = data.get("entries") or {}
+        if self._key_pending:
+            n = sum(len(e.get("events") or []) for e in self._key_pending.values())
+            _log(f"{self.tag} restored {n} pending (undecryptable) event(s)")
+
+    def _save_key_pending(self) -> None:
+        try:
+            payload = {"ts": int(time.time()), "entries": self._key_pending}
+            self._pending_file.write_text(
+                json.dumps(payload, indent=1, sort_keys=True),
+                encoding="utf-8")
+        except OSError as exc:
+            _log(f"{self.tag} saving pending keys failed: {exc}")
+
+    def _register_pending(self, ev: dict, raw: dict) -> None:
+        """Remember an undecryptable event and (re)request its key once."""
+        room_id = str(ev.get("room_id") or "")
+        sender_key = str(raw.get("sender_key") or "")
+        session_id = str(raw.get("session_id") or "")
+        if not (room_id and sender_key and session_id):
+            return
+        key = f"{room_id}|{sender_key}|{session_id}"
+        entry = self._key_pending.setdefault(key, {
+            "user": ev.get("sender"),
+            "requests": 0,
+            "last_req": 0.0,
+            "events": [],
+        })
+        for e in entry["events"]:
+            if e.get("event_id") == ev.get("event_id"):
+                return  # already queued
+        entry["events"].append({
+            "event_id": ev.get("event_id"),
+            "sender": ev.get("sender"),
+            "room_name": ev.get("room_name"),
+            "ts": ev.get("ts"),
+            "raw": raw,
+        })
+        self._try_request_key(entry, room_id, sender_key, session_id)
+        self._save_key_pending()
+
+    def _try_request_key(self, entry: dict, room_id: str,
+                         sender_key: str, session_id: str) -> bool:
+        """Send (or re-send, throttled) a room-key request to the sender."""
+        user = entry.get("user")
+        if not user or user == self.bot.user_id:
+            return False
+        now = time.time()
+        if entry["requests"] >= 4:
+            return False
+        if entry["requests"] and now - entry["last_req"] < 90.0:
+            return False
+        recipient = "*"
+        if self.bot.crypto.find_device_with_curve(user, sender_key):
+            recipient = (self.bot.crypto.find_device_with_curve(
+                user, sender_key) or "*")
+        try:
+            self.bot.crypto.request_room_key(
+                user, recipient, room_id, sender_key, session_id)
+        except MatrixError as exc:
+            _log(f"{self.tag} key request failed: {exc}")
+            return False
+        except Exception as exc:  # noqa: BLE001
+            _log(f"{self.tag} key request failed: {exc!r}")
+            return False
+        entry["requests"] += 1
+        entry["last_req"] = now
+        return True
+
+    def _retry_pending_keys(self) -> list[dict]:
+        """Re-attempt the pending events: the key may have arrived via
+        to-device since they failed.  Returns decrypted events, oldest per
+        group first, ready for the normal pipeline."""
+        recovered: list[dict] = []
+        if not self._key_pending:
+            return recovered
+        now = time.time()
+        changed = False
+        for key in list(self._key_pending):
+            room_id, sender_key, session_id = key.split("|", 2)
+            entry = self._key_pending[key]
+            left: list[dict] = []
+            had = len(entry.get("events") or [])
+            for meta in entry.get("events") or []:
+                try:
+                    content = self.bot.crypto.decrypt_room_content(
+                        meta.get("raw") or {})
+                except CryptoError as exc:
+                    if "no megolm session" in str(exc):
+                        left.append(meta)      # key still missing: keep
+                    # else (e.g. index before imported start): give up on it
+                    continue
+                except Exception:  # noqa: BLE001
+                    left.append(meta)
+                    continue
+                if not isinstance(content.get("body"), str):
+                    continue
+                recovered.append({
+                    "room_id": room_id,
+                    "room_name": (self._room_names.get(room_id)
+                                  or meta.get("room_name")),
+                    "event_id": meta.get("event_id"),
+                    "sender": meta.get("sender"),
+                    "ts": meta.get("ts"),
+                    "event_type": "m.room.message",
+                    "body": content["body"],
+                    "msgtype": content.get("msgtype", "m.text"),
+                })
+            if left:
+                entry["events"] = left
+                if now - entry["last_req"] >= 120.0 and \
+                        self._try_request_key(entry, room_id, sender_key,
+                                              session_id):
+                    changed = True
+            else:
+                del self._key_pending[key]
+            if len(left) != had:
+                changed = True
+        if recovered:
+            _log(f"{self.tag} decrypted {len(recovered)} previously stuck "
+                 "message(s) after room-key import")
+        if changed:
+            self._save_key_pending()
+        return recovered
 
     def start(self) -> None:
+        self._load_key_pending()
         self._thread = threading.Thread(target=self._run,
                                         name=f"watch-{self.bot.name}", daemon=True)
         self._thread.start()
@@ -353,14 +495,73 @@ class MessageWatcher:
             for ev in result["events"]:
                 if ev.get("room_name"):
                     self._room_names[ev["room_id"]] = ev["room_name"]
+            # Key material delivered in the snapshot can still be useful
+            # later (group keys shared before we logged in): import it.
+            to_device = result.get("to_device") or []
+            if to_device:
+                self._ingest_todevice(to_device)
+            # Stuck (undecryptable) events restored from disk may decrypt now
+            # that carried-over state covers them; they are not history.
+            for ev in self._retry_pending_keys():
+                self._handle(ev)
             _log(f"{self.tag} primed ({len(result['events'])} historical "
                  f"message(s) skipped)")
             return
-        if not result["events"]:
+        to_device = result.get("to_device") or []
+        if to_device:
+            self._ingest_todevice(to_device)
+        # The key failed events were waiting for may have just arrived —
+        # retry them before processing the fresh timeline events.
+        events = self._retry_pending_keys() + self._decrypt_events(
+            result.get("events") or [])
+        if not events:
             return
-        _log(f"{self.tag} +{len(result['events'])} message(s)")
-        for ev in result["events"]:
+        _log(f"{self.tag} +{len(events)} message(s)")
+        for ev in events:
             self._handle(ev)
+
+    def _ingest_todevice(self, events: list[dict]) -> None:
+        """Feed to-device (Olm/Megolm) events into the bot's crypto layer.
+
+        Best-effort: a failure must never kill the watcher loop.
+        """
+        try:
+            self.bot.crypto.handle_todevice(events)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"{self.tag} crypto: to-device ingest failed: {exc!r}")
+
+    def _decrypt_events(self, events: list[dict]) -> list[dict]:
+        """Decrypt m.room.encrypted timeline events; drop the ones that
+        cannot be decrypted (they would be unusable to the model)."""
+        out: list[dict] = []
+        for ev in events:
+            if ev.get("event_type") != "m.room.encrypted":
+                out.append(ev)
+                continue
+            raw = ev.get("raw") or {}
+            try:
+                content = self.bot.crypto.decrypt_room_content(raw)
+            except CryptoError as exc:
+                _log(f"{self.tag} {ev.get('room_id')} {ev.get('event_id') or ''}: "
+                     f"not decrypted ({exc}); queued for key request")
+                # The sender's client may still share the group key once asked
+                # (m.room_key_request).  Queue the event so it is decrypted —
+                # and handled — as soon as the key arrives.
+                self._register_pending(ev, raw)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                _log(f"{self.tag} {ev.get('room_id')} {ev.get('event_id') or ''}: "
+                     f"not decrypted ({exc}); skipping")
+                continue
+            if not isinstance(content.get("body"), str):
+                # Decrypted fine but not a plain text message (poll, notice
+                # without body, ...): the pipeline expects a body, so skip.
+                continue
+            out.append({**ev,
+                        "event_type": "m.room.message",
+                        "body": content["body"],
+                        "msgtype": content.get("msgtype", "m.text")})
+        return out
 
     # -- wrench reactions -----------------------------------------------------
 
@@ -517,7 +718,8 @@ class MessageWatcher:
                       room_id: str, ev: dict) -> None:
         room_name = ev.get("room_name")
         try:
-            history = self.bot.client.read_messages(room_id, limit=trig.context)
+            history = self.bot.client.read_messages(room_id, limit=trig.context,
+                                                    crypto=self.bot.crypto)
         except MatrixError as exc:
             _log(f"{tag} reading history failed: {exc}")
             history = [ev]

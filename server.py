@@ -159,7 +159,7 @@ def messages(room_id: str):
                                  "X-API-Key (or Authorization: Bearer ...)"}), 401
     try:
         limit = request.args.get("limit", 50, type=int)
-        events = bot.client.read_messages(room_id, limit=limit)
+        events = bot.client.read_messages(room_id, limit=limit, crypto=bot.crypto)
     except MatrixError as exc:
         return jsonify({"error": f"matrix read failed: {exc}"}), 502
     return jsonify({"bot": bot.name, "room": room_id, "messages": events})
