@@ -6,8 +6,10 @@
 #     sudo bash linux_systemd_deploy.sh
 #
 # What it does:
-#   1. creates a virtualenv at ./.venv (reused if it already exists) and
-#      installs requirements.txt into it;
+#   1. creates a virtualenv at ./.venv pinned to Python 3.12 (python-olm
+#      ships wheels only up to cp312) and installs requirements.txt into it;
+#      an existing venv is reused only if it is 3.12 with a working `import olm`,
+#      otherwise it is recreated;
 #   2. writes /etc/systemd/system/matrix-webhooker.service
 #      (runs as the user who deployed it, WorkingDirectory = this directory,
 #      the app loads .env / bots.json from there — same as `python3 server.py`);
@@ -58,14 +60,68 @@ command -v python3 >/dev/null \
 [ -f requirements.txt ] || fail "requirements.txt not found (script not in the app directory?)"
 
 # --- virtualenv --------------------------------------------------------------
+# Pinned to Python 3.12: requirements.txt includes python-olm, whose latest
+# release (3.2.16) ships wheels only up to cp312 — on newer Pythons pip must
+# build it from source and the build fails (no `import olm` -> service crash).
+# Bump this only when a python-olm wheel exists for the target version.
+WANT_PY_MINOR=12
 VENV="$APP_DIR/.venv"
-if [ ! -x "$VENV/bin/python" ]; then
-  echo "Creating virtualenv at $VENV ..."
-  python3 -m venv "$VENV" \
-    || fail "python3 -m venv failed — install the venv package first (e.g. apt install python3-venv)"
-  "$VENV/bin/python" -m pip install --quiet --upgrade pip
+
+py_minor() {  # print "MAJOR.MINOR" of a python executable
+  "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null
+}
+
+find_uv() {  # locate uv (sudo resets PATH, so check the user's dirs too)
+  command -v uv 2>/dev/null && return 0
+  local d
+  for d in "$RUN_HOME/.local/bin" "$RUN_HOME/.cargo/bin"; do
+    if [ -x "$d/uv" ]; then echo "$d/uv"; return 0; fi
+  done
+  return 1
+}
+
+venv_is_ok() {  # existing venv: right python AND the E2E stack imports
+  [ -x "$VENV/bin/python" ] || return 1
+  [ "$(py_minor "$VENV/bin/python")" = "3.$WANT_PY_MINOR" ] || return 1
+  "$VENV/bin/python" -c 'import olm' 2>/dev/null || return 1
+  return 0
+}
+
+create_venv() {
+  local uv_bin
+  if uv_bin=$(find_uv); then
+    echo "Creating virtualenv at $VENV (Python 3.$WANT_PY_MINOR, via uv) ..."
+    "$uv_bin" venv --python "3.$WANT_PY_MINOR" "$VENV"
+  elif command -v "python3.$WANT_PY_MINOR" >/dev/null; then
+    echo "Creating virtualenv at $VENV (Python 3.$WANT_PY_MINOR) ..."
+    "python3.$WANT_PY_MINOR" -m venv "$VENV"
+  else
+    fail "need Python 3.$WANT_PY_MINOR for the venv (python-olm has no wheel for newer Pythons): install it, e.g. 'uv python install 3.$WANT_PY_MINOR' or 'apt install python3.$WANT_PY_MINOR', then re-run"
+  fi
   echo "Installing Python dependencies (requirements.txt) ..."
-  "$VENV/bin/python" -m pip install --quiet -r requirements.txt
+  if [ -n "${uv_bin:-}" ]; then
+    "$uv_bin" pip install --python "$VENV/bin/python" -q -r requirements.txt
+  else
+    "$VENV/bin/python" -m pip install --quiet --upgrade pip
+    "$VENV/bin/python" -m pip install --quiet -r requirements.txt
+  fi
+  "$VENV/bin/python" -c 'import olm' \
+    || fail "dependencies installed but 'import olm' fails — python-olm incompatible with this venv"
+}
+
+if venv_is_ok; then
+  echo "Reusing existing virtualenv at $VENV (Python 3.$WANT_PY_MINOR, olm OK) ..."
+elif [ -e "$VENV" ]; then
+  echo "Existing $VENV is not a usable Python 3.$WANT_PY_MINOR venv (wrong python or missing olm) — recreating ..."
+  rm -rf "$VENV"
+  create_venv
+else
+  create_venv
+fi
+# deployed via root/sudo would leave the venv root-owned — hand it to the
+# service user so the running service can maintain it
+if [ "$(id -u)" -eq 0 ]; then
+  chown -R "$RUN_USER:$RUN_GROUP" "$VENV"
 fi
 PY_BIN="$VENV/bin/python"
 
