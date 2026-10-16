@@ -332,10 +332,11 @@ class Matrix:
 
     def read_messages(self, room_id: str, limit: int = 50,
                       crypto: BotCrypto | None = None) -> list[dict]:
-        """Last ``limit`` room events of type m.room.message, oldest first.
+        """Last ``limit`` room events (m.room.message + m.reaction), oldest first.
 
         Encrypted events are decrypted when ``crypto`` is given; events that
-        cannot be decrypted are skipped.
+        cannot be decrypted are skipped. Reactions appear as
+        ``{"type": "m.reaction", "reacts_to": <event_id>, "key": <emoji>}``.
         """
         limit = max(1, min(int(limit), 100))
         data = self._request("GET", f"{self.hs}/_matrix/client/v3/rooms/"
@@ -351,6 +352,22 @@ class Matrix:
                     content = crypto.decrypt_room_content(ev.get("content", {}))
                 except CryptoError:
                     continue
+            elif etype == "m.reaction":
+                rel = (ev.get("content", {}) or {}).get("m.relates_to") or {}
+                if rel.get("rel_type") != "m.annotation":
+                    continue
+                key = rel.get("key")
+                if not isinstance(key, str):
+                    continue
+                out.append({
+                    "event_id": ev.get("event_id"),
+                    "sender": ev.get("sender"),
+                    "ts": ev.get("origin_server_ts"),
+                    "type": "m.reaction",
+                    "reacts_to": rel.get("event_id"),
+                    "key": key,
+                })
+                continue
             else:
                 continue
             body = content.get("body")
@@ -362,6 +379,7 @@ class Matrix:
                 "msgtype": content.get("msgtype", "m.text"),
                 "body": body,
                 "ts": ev.get("origin_server_ts"),
+                "type": "m.room.message",
             })
         return out
 
