@@ -249,17 +249,31 @@ What has to be true for a call to work:
   `state_default` is 50. Greyed-out call buttons in a room where you sit at
   `users_default: 0` come from exactly this (rooms an old bot account created:
   `_fix_power_levels.py` repairs them).
-- The bot mirrors the membership shape the caller used
-  (`org.matrix.msc3401.call.member` or `org.matrix.msc4143.rtc.member`),
-  exchanges an OpenID token for a LiveKit JWT at the homeserver's JWT service
-  and joins the SFU. No TURN server is needed — media goes through the SFU.
+- The bot mirrors the caller's membership event — state key
+  (`_@user_device_m.call` in current Element Call), `call_id`, `foci_preferred`,
+  intent and expiry — and swaps in its own identity
+  (`org.matrix.msc3401.call.member` / `org.matrix.msc4143.rtc.member`). It then
+  exchanges an OpenID token for a LiveKit JWT and joins the SFU. No TURN server
+  is needed — media goes through the SFU.
+- **The LiveKit identity has to be the one the dialect implies.** For the
+  MSC3401 shape that is `userId:deviceId`, obtained from the JWT service's
+  older `/sfu/get`; the bot publishes the same string as `membershipID`. If the
+  two ever disagree, the call still "works" — the bot hears you, answers in
+  text — but your client has no membership to attach the bot's audio track to,
+  so **you hear nothing**. The log line says both:
+  `joined … as @bot:host:DEVICE (state key '_@bot:host_DEVICE_m.call')`.
 
 How it behaves:
 
 - Each utterance (energy VAD: `vad_threshold`, `silence_end`, `min_speech`,
   `max_utterance`) is sent to whisper. The command gets the usual placeholders
   plus **`{{transcript}}`**, and its **stdout is what gets spoken** — keep
-  answers short, TTS costs roughly 3× the audio length. While the bot speaks it
+  answers short, TTS costs roughly 3× the audio length.
+- Turn taking: while the bot speaks, incoming audio has to be
+  `echo_factor` (default 2.5) times louder than `vad_threshold` to count —
+  that is its own voice coming back through your microphone. Speak clearly
+  over it for `barge_in` seconds (default 0.4) and the bot stops talking and
+  listens. The greeting is skipped when you started speaking first. While the bot speaks it
   ignores incoming audio (half duplex, no self-answering).
   Like the trigger commands, this is a **bash command line**: the placeholders
   are substituted shell-quoted, but the rest of the text is not — so quote your
