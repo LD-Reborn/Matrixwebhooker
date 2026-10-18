@@ -282,6 +282,20 @@ How it behaves:
   (`VOICE_CACHE_DIR`, default `<state dir>/voice-cache`): synthesizing them at
   join time costs ~9 s, long enough for the caller to have asked their
   question already — which is exactly what it used to sound like.
+- Where the time goes: tts on this gateway takes **~3.5× the length of what it
+  speaks**, does not stream (the first byte arrives once the clip is finished)
+  and serializes — two concurrent requests take exactly as long as two in a
+  row.  So the length of the answer *is* the latency: `max_answer_chars`
+  (default 220) clips it and the command prompt should ask for one short
+  sentence.  Every stage logs its own timing:
+
+  ```
+  [speech] stt: 2.1s of audio -> 52 chars in 2.4s
+  [call:…] heard: Wie viel Grad Celsius ist es gerade in Gelsenkirchen?
+  [call:…] agent answered in 41.2s
+  [speech] tts: 118 chars -> 7.9s of audio in 27.4s (first byte 27.3s, 380 KB)
+  [call:…] speaking 7.9s: Aktuell sind es 12 Grad. (+71.0s after the caller)
+  ```
   Like the trigger commands, this is a **bash command line**: the placeholders
   are substituted shell-quoted, but the rest of the text is not — so quote your
   prompt or leave out `(`, `)`, `;`, `|`, `&`, `$` (an unquoted parenthesis is

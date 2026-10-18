@@ -152,11 +152,12 @@ def _rms(data: bytes) -> float:
     return (sum(s * s for s in samples) / len(samples)) ** 0.5
 
 
-def clip_for_speech(text: str, limit: int = 400) -> str:
+def clip_for_speech(text: str, limit: int = 220) -> str:
     """Shorten an answer at a sentence boundary.
 
-    TTS costs about three times the length of what it speaks, so a long answer
-    is both slow and something the caller stops listening to.
+    Measured on the gateway: tts takes ~3.5x the length of what it speaks and
+    does not stream, so the caller waits that long before hearing anything.
+    The length of the answer *is* the latency - hence a tight default.
     """
     if len(text) <= limit:
         return text
@@ -451,6 +452,7 @@ class CallSession:
         import asyncio
 
         loop = asyncio.get_running_loop()
+        t_start = time.monotonic()
         try:
             text = await loop.run_in_executor(
                 None, lambda: self.mgr.speech.transcribe(pcm, OUT_RATE, self.cfg.language))
@@ -467,12 +469,13 @@ class CallSession:
             if not done and not self.stopping.is_set():
                 await self._speak(self.cfg.thinking_cue, cached=True)
         answer = await fut
+        _log(f"{self.tag} agent answered in {time.monotonic() - t_start:.1f}s")
         if answer:
-            spoken = clip_for_speech(answer)
+            spoken = clip_for_speech(answer, self.cfg.max_answer_chars)
             if spoken != answer:
                 _log(f"{self.tag} answer trimmed for speech: "
                      f"{len(answer)} -> {len(spoken)} chars")
-            await self._speak(spoken)
+            await self._speak(spoken, t0=t_start)
         if self.cfg.log_transcripts:
             await loop.run_in_executor(None, self._log_to_room, text, answer)
 
@@ -484,7 +487,18 @@ class CallSession:
         except MatrixError as exc:
             _log(f"{self.tag} writing the call record to the room failed: {exc}")
 
-    async def _speak(self, text: str, cached: bool = False) -> None:
+    async def _speak(self, text: str, cached: bool = False,
+                     t0: float = 0.0) -> None:
+        """Speak ``text``.
+
+        ``t0`` (a time.monotonic reading for when the caller finished speaking)
+        is only used to log how long the answer took to start.
+
+        One request per answer, deliberately: the tts backend serializes (two
+        concurrent requests take exactly as long as two in a row), so
+        splitting an answer only moves the wait into the middle of the
+        sentence.  What helps is saying less - see ``max_answer_chars``.
+        """
         import asyncio
 
         from livekit import rtc
@@ -499,13 +513,15 @@ class CallSession:
                                                          self.cfg.language))
             else:
                 pcm, rate = await loop.run_in_executor(
-                    None, self.mgr.speech.synthesize, text)
+                    None, lambda: self.mgr.speech.synthesize(
+                        text, language=self.cfg.language or None))
                 pcm = resample(pcm, rate, OUT_RATE)
         except SpeechError as exc:
             _log(f"{self.tag} {exc}")
             return
         seconds = len(pcm) / 2 / OUT_RATE
-        _log(f"{self.tag} speaking {seconds:.1f}s: {text[:100]}")
+        note = f" (+{time.monotonic() - t0:.1f}s after the caller)" if t0 else ""
+        _log(f"{self.tag} speaking {seconds:.1f}s: {text[:100]}{note}")
         self._interrupted = False
         self._echo_until = time.monotonic() + seconds + 0.5
         size = int(OUT_RATE * FRAME_MS / 1000) * 2

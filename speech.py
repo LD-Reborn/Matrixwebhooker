@@ -26,6 +26,7 @@ import math
 import os
 import struct
 import sys
+import time
 import wave
 from dataclasses import dataclass
 from io import BytesIO
@@ -154,6 +155,7 @@ class Speech:
         if lang:
             form["language"] = lang
         params = {"model": self.cfg.stt_model}   # the proxy only sees it here
+        t0 = time.monotonic()
         try:
             resp = requests.post(
                 self._url("audio/transcriptions", params),
@@ -164,9 +166,12 @@ class Speech:
         if resp.status_code >= 400:
             raise SpeechError(f"stt http {resp.status_code}: {resp.text[:200]}")
         try:
-            return (resp.json().get("text") or "").strip()
+            text = (resp.json().get("text") or "").strip()
         except ValueError as exc:
             raise SpeechError(f"stt answer is not json: {resp.text[:200]}") from exc
+        self.on_log(f"stt: {len(pcm) / 2 / rate:.1f}s of audio -> {len(text)} chars "
+                    f"in {time.monotonic() - t0:.1f}s")
+        return text
 
     def synthesize(self, text: str, voice: str | None = None,
                    language: str | None = None) -> tuple[bytes, int]:
@@ -190,22 +195,45 @@ class Speech:
         lang = language if language is not None else self.cfg.language
         if lang:
             payload["language"] = lang
+        t0 = time.monotonic()
         try:
             resp = requests.post(self._url("audio/speech"), json=payload,
-                                 timeout=self.tts_timeout)
+                                 timeout=self.tts_timeout, stream=True)
         except requests.RequestException as exc:
             raise SpeechError(f"tts request failed: {exc}") from exc
         if resp.status_code >= 400 and "language" in payload:
             # a code the tts backend does not know: speak anyway, uncontrolled
+            resp.close()
             payload.pop("language")
             try:
                 resp = requests.post(self._url("audio/speech"), json=payload,
-                                     timeout=self.tts_timeout)
+                                     timeout=self.tts_timeout, stream=True)
             except requests.RequestException as exc:
                 raise SpeechError(f"tts request failed: {exc}") from exc
         if resp.status_code >= 400:
-            raise SpeechError(f"tts http {resp.status_code}: {resp.text[:200]}")
-        return wav_to_pcm(resp.content)
+            detail = resp.text[:200]
+            resp.close()
+            raise SpeechError(f"tts http {resp.status_code}: {detail}")
+        # read as it arrives: the gateway generates the whole clip before it
+        # sends a single byte, so "first byte" is where the time actually goes
+        chunks: list[bytes] = []
+        first: float | None = None
+        try:
+            for chunk in resp.iter_content(65536):
+                if first is None:
+                    first = time.monotonic() - t0
+                chunks.append(chunk)
+        except requests.RequestException as exc:
+            raise SpeechError(f"tts download failed: {exc}") from exc
+        finally:
+            resp.close()
+        raw = b"".join(chunks)
+        pcm, rate = wav_to_pcm(raw)
+        wall = time.monotonic() - t0
+        self.on_log(f"tts: {len(text)} chars -> {len(pcm) / 2 / rate:.1f}s of audio "
+                    f"in {wall:.1f}s (first byte {first or wall:.1f}s, "
+                    f"{len(raw) / 1024:.0f} KB)")
+        return pcm, rate
 
     def cached(self, text: str, rate: int = 48000,
                language: str | None = None) -> bytes:
