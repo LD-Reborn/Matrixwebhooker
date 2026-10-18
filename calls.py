@@ -149,6 +149,23 @@ def _rms(data: bytes) -> float:
     return (sum(s * s for s in samples) / len(samples)) ** 0.5
 
 
+def clip_for_speech(text: str, limit: int = 400) -> str:
+    """Shorten an answer at a sentence boundary.
+
+    TTS costs about three times the length of what it speaks, so a long answer
+    is both slow and something the caller stops listening to.
+    """
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    for sep in (". ", "! ", "? ", ".\n", "\n"):
+        cut = head.rfind(sep)
+        if cut > limit // 2:
+            return head[:cut + 1].strip()
+    cut = head.rfind(" ")
+    return (head[:cut] if cut > limit // 2 else head).strip() + " …"
+
+
 # ---------------------------------------------------------------------------
 # one live call
 # ---------------------------------------------------------------------------
@@ -182,6 +199,7 @@ class CallSession:
         self._speech = 0.0
         self._silence = 0.0
         self._loud = 0.0
+        self._loud_buf = bytearray()      # what was loud while we ourselves spoke
         self._in_speech = False
         self._echo_until = 0.0          # half duplex: damp input while we speak
         self._interrupted = False       # the caller cut us off
@@ -369,6 +387,10 @@ class CallSession:
         if _rms(frame.data) >= threshold:
             if gated:
                 self._loud += dur
+                self._loud_buf.extend(frame.data)
+                keep = int(OUT_RATE * 0.8) * 2        # at most 0.8 s of it
+                if len(self._loud_buf) > keep:
+                    del self._loud_buf[:len(self._loud_buf) - keep]
                 if self._loud < self.cfg.barge_in:
                     return                    # still most likely our own echo
                 _log(f"{self.tag} caller interrupted us after "
@@ -378,6 +400,11 @@ class CallSession:
             self._in_speech = True
             self._speech += dur
             self._silence = 0.0
+            if not self._buf:
+                # whatever was loud while we were talking was the caller, not
+                # our echo — keep it, otherwise the first words are missing
+                self._buf.extend(self._loud_buf)
+            self._loud_buf = bytearray()
             self._buf.extend(frame.data)
             if self._speech >= self.cfg.max_utterance:
                 _log(f"{self.tag} utterance hit max_utterance; cutting")
@@ -385,6 +412,7 @@ class CallSession:
             return
 
         self._loud = 0.0
+        self._loud_buf = bytearray()
         if not self._in_speech:
             return
         self._buf.extend(frame.data)            # keep the trailing word
@@ -409,6 +437,7 @@ class CallSession:
         self._buf = bytearray()
         self._in_speech, self._speech = False, 0.0
         self._silence = self._loud = 0.0
+        self._loud_buf = bytearray()
         if speech < self.cfg.min_speech or len(pcm) < OUT_RATE // 4:
             return
         _log(f"{self.tag} utterance {speech:.1f}s -> stt")
@@ -438,7 +467,11 @@ class CallSession:
                 await self._speak(self.cfg.thinking_cue, cached=True)
         answer = await fut
         if answer:
-            await self._speak(answer)
+            spoken = clip_for_speech(answer)
+            if spoken != answer:
+                _log(f"{self.tag} answer trimmed for speech: "
+                     f"{len(answer)} -> {len(spoken)} chars")
+            await self._speak(spoken)
         if self.cfg.log_transcripts:
             await loop.run_in_executor(None, self._log_to_room, text, answer)
 

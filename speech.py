@@ -128,9 +128,12 @@ def tone(seconds: float, freq: float = 440.0, rate: int = 48000, amp: int = 6000
 
 class Speech:
     def __init__(self, cfg: SpeechConfig, on_log=None, timeout: float = 30.0,
-                 cache_dir=None):
+                 cache_dir=None, tts_timeout: float = 90.0):
         self.cfg = cfg
         self.timeout = timeout
+        #: qwen3-tts needs roughly three times the length of what it speaks, so
+        #: a long answer easily runs past the ordinary 30 s budget
+        self.tts_timeout = tts_timeout
         self.on_log = on_log or (lambda msg: print(f"[speech] {msg}", file=sys.stderr))
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self._cache: dict[str, bytes] = {}
@@ -189,7 +192,7 @@ class Speech:
             payload["language"] = lang
         try:
             resp = requests.post(self._url("audio/speech"), json=payload,
-                                 timeout=self.timeout)
+                                 timeout=self.tts_timeout)
         except requests.RequestException as exc:
             raise SpeechError(f"tts request failed: {exc}") from exc
         if resp.status_code >= 400 and "language" in payload:
@@ -197,7 +200,7 @@ class Speech:
             payload.pop("language")
             try:
                 resp = requests.post(self._url("audio/speech"), json=payload,
-                                     timeout=self.timeout)
+                                     timeout=self.tts_timeout)
             except requests.RequestException as exc:
                 raise SpeechError(f"tts request failed: {exc}") from exc
         if resp.status_code >= 400:
