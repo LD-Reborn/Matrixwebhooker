@@ -84,6 +84,8 @@ class CallConfig:
     log_transcripts: bool = True          # post heard + answer into the room
     max_answer_chars: int = 220   # spoken answers are clipped to this (tts is
                                   # ~3.5x the length of what it speaks)
+    max_command_seconds: int = 90  # a command that takes longer is killed
+    sorry_line: str = "Das hat zu lange gedauert, frag bitte nochmal."
     vad_threshold: int = 400        # rms of 16-bit pcm that counts as speech
     echo_factor: float = 2.5        # while we speak, input must be this louder
     barge_in: float = 0.4           # seconds of that before we stop talking
@@ -131,6 +133,7 @@ def call_config_from(entry: dict, path: Path) -> CallConfig:
         max_utterance = float(raw.get("max_utterance", 20.0))
         cue_after = float(raw.get("cue_after", 2.0))
         max_answer_chars = int(raw.get("max_answer_chars", 220))
+        max_command_seconds = int(raw.get("max_command_seconds", 90))
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"{path}: 'call': numeric setting is not a number: {exc}") from exc
     if not 1 <= context <= 100:
@@ -149,6 +152,9 @@ def call_config_from(entry: dict, path: Path) -> CallConfig:
         cue_after=cue_after,
         log_transcripts=bool(raw.get("log_transcripts", True)),
         max_answer_chars=max_answer_chars,
+        max_command_seconds=max_command_seconds,
+        sorry_line=str(raw.get("sorry_line",
+                               "Das hat zu lange gedauert, frag bitte nochmal.")),
         vad_threshold=vad,
         echo_factor=echo_factor,
         barge_in=barge_in,

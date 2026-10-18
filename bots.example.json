@@ -36,7 +36,8 @@
         "echo_factor": 2.5,
         "barge_in": 0.4,
         "silence_end": 0.9,
-        "max_answer_chars": 220
+        "max_answer_chars": 220,
+        "max_command_seconds": 90
       }
     }
   ]

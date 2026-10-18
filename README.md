@@ -296,6 +296,10 @@ How it behaves:
   [speech] tts: 118 chars -> 7.9s of audio in 27.4s (first byte 27.3s, 380 KB)
   [call:…] speaking 7.9s: Aktuell sind es 12 Grad. (+71.0s after the caller)
   ```
+
+  The agent is usually the slow part (it may search the web), so
+  `max_command_seconds` (default 90) kills a command that runs longer and
+  speaks `sorry_line` instead of leaving the caller in silence.
   Like the trigger commands, this is a **bash command line**: the placeholders
   are substituted shell-quoted, but the rest of the text is not — so quote your
   prompt or leave out `(`, `)`, `;`, `|`, `&`, `$` (an unquoted parenthesis is

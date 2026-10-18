@@ -27,6 +27,7 @@ import json
 import os
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -208,6 +209,7 @@ class CallSession:
         self._echo_until = 0.0          # half duplex: damp input while we speak
         self._interrupted = False       # the caller cut us off
         self._skip_leave = False        # replaced by a newer session
+        self._timed_out = False         # the answer command was killed
         self._source = None
         self._thread: threading.Thread | None = None
         self.tag = f"[call:{self.bot.name}:{room_id[:14]}]"
@@ -476,6 +478,9 @@ class CallSession:
                 _log(f"{self.tag} answer trimmed for speech: "
                      f"{len(answer)} -> {len(spoken)} chars")
             await self._speak(spoken, t0=t_start)
+        elif self._timed_out and self.cfg.sorry_line:
+            # silence is worse than an apology: the caller is still holding
+            await self._speak(self.cfg.sorry_line, cached=True, t0=t_start)
         if self.cfg.log_transcripts:
             await loop.run_in_executor(None, self._log_to_room, text, answer)
 
@@ -563,6 +568,7 @@ class CallSession:
                    MATRIX_CHANNEL=self.room_name or self.room_id,
                    MATRIX_CALL="1", MCP_BOT=self.bot.name)
         out = ""
+        self._timed_out = False
         try:
             for command in self.cfg.commands:
                 cmdline = render(command, values)
@@ -571,7 +577,20 @@ class CallSession:
                                         cwd=str(BASE_DIR), stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True,
                                         start_new_session=True)
-                stdout, stderr = proc.communicate()
+                try:
+                    stdout, stderr = proc.communicate(
+                        timeout=self.cfg.max_command_seconds)
+                except subprocess.TimeoutExpired:
+                    # start_new_session=True, so the whole process tree goes
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        proc.kill()
+                    stdout, stderr = proc.communicate()
+                    self._timed_out = True
+                    _log(f"{self.tag} no answer after "
+                         f"{self.cfg.max_command_seconds}s: killed the command")
+                    break
                 if proc.returncode != 0:
                     _log(f"{self.tag} exit {proc.returncode}: "
                          f"{str(stderr or stdout)[-300:]}")
@@ -617,7 +636,8 @@ class CallManager:
         """
         if self.speech is None:
             return
-        phrases = [p for p in (self.cfg.greeting, self.cfg.thinking_cue) if p]
+        phrases = [p for p in (self.cfg.greeting, self.cfg.thinking_cue,
+                               self.cfg.sorry_line) if p]
 
         def _warm() -> None:
             for phrase in phrases:
