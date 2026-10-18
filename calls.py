@@ -40,6 +40,9 @@ from triggers import _shell_prefix, format_history, render, write_context_files
 #: sample rate we publish at (LiveKit's native Opus rate)
 OUT_RATE = 48000
 FRAME_MS = 20
+#: seconds of audio kept ahead of an utterance, so an interruption that starts
+#: while we are still talking does not lose its first words
+PRE_ROLL = 0.8
 
 
 def _log(msg: str) -> None:
@@ -199,7 +202,7 @@ class CallSession:
         self._speech = 0.0
         self._silence = 0.0
         self._loud = 0.0
-        self._loud_buf = bytearray()      # what was loud while we ourselves spoke
+        self._pre = bytearray()           # audio kept ahead of an utterance
         self._in_speech = False
         self._echo_until = 0.0          # half duplex: damp input while we speak
         self._interrupted = False       # the caller cut us off
@@ -384,13 +387,17 @@ class CallSession:
         gated = time.monotonic() < self._echo_until
         threshold = self.cfg.vad_threshold * (self.cfg.echo_factor if gated else 1.0)
 
+        # keep a little audio ahead of every utterance: a caller who starts
+        # talking while we are still speaking would otherwise lose their first
+        # words, and that is exactly when they are interrupting us
+        self._pre.extend(frame.data)
+        keep = int(OUT_RATE * PRE_ROLL) * 2
+        if len(self._pre) > keep:
+            del self._pre[:len(self._pre) - keep]
+
         if _rms(frame.data) >= threshold:
             if gated:
                 self._loud += dur
-                self._loud_buf.extend(frame.data)
-                keep = int(OUT_RATE * 0.8) * 2        # at most 0.8 s of it
-                if len(self._loud_buf) > keep:
-                    del self._loud_buf[:len(self._loud_buf) - keep]
                 if self._loud < self.cfg.barge_in:
                     return                    # still most likely our own echo
                 _log(f"{self.tag} caller interrupted us after "
@@ -401,10 +408,7 @@ class CallSession:
             self._speech += dur
             self._silence = 0.0
             if not self._buf:
-                # whatever was loud while we were talking was the caller, not
-                # our echo — keep it, otherwise the first words are missing
-                self._buf.extend(self._loud_buf)
-            self._loud_buf = bytearray()
+                self._buf.extend(self._pre)
             self._buf.extend(frame.data)
             if self._speech >= self.cfg.max_utterance:
                 _log(f"{self.tag} utterance hit max_utterance; cutting")
@@ -412,7 +416,6 @@ class CallSession:
             return
 
         self._loud = 0.0
-        self._loud_buf = bytearray()
         if not self._in_speech:
             return
         self._buf.extend(frame.data)            # keep the trailing word
@@ -437,7 +440,6 @@ class CallSession:
         self._buf = bytearray()
         self._in_speech, self._speech = False, 0.0
         self._silence = self._loud = 0.0
-        self._loud_buf = bytearray()
         if speech < self.cfg.min_speech or len(pcm) < OUT_RATE // 4:
             return
         _log(f"{self.tag} utterance {speech:.1f}s -> stt")
