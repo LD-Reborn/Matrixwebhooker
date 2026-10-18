@@ -1,0 +1,4 @@
+# Voice calls (MatrixRTC / Element Call). Install this next to
+# requirements.txt in the same venv to let a bot answer calls; without it the
+# bot still runs, it just reports that it cannot join calls.
+livekit>=1.0

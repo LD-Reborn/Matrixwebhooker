@@ -1,0 +1,565 @@
+"""Answering MatrixRTC (Element Call) calls with speech.
+
+A bot with ``"call": {"enabled": true, "command": "…"}`` in ``bots.json``
+joins a call that someone else started in a room it is in:
+
+  1. the watcher hands us the room's changed call-membership state events
+     (``org.matrix.msc3401.call.member`` / ``org.matrix.msc4143.rtc.member``);
+  2. we publish *our own* membership, mirroring the shape the caller used
+     (that keeps us compatible with whatever Element Call version is out
+     there), and ask the homeserver's JWT service for a LiveKit token;
+  3. we join the LiveKit SFU, listen to the other participants, cut their
+     speech into utterances (energy VAD), send each utterance to whisper,
+     run the configured command with the transcript and speak the answer
+     back through the TTS gateway;
+  4. when the last other membership disappears (or the slot closes, or a bare
+     ``stop`` arrives, or ``max_seconds`` elapse) we withdraw our membership
+     and leave.
+
+The media side needs the optional ``livekit`` package; without it the module
+still imports and the bot just reports that it cannot answer calls.
+"""
+
+from __future__ import annotations
+
+import array
+import json
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+from matrixbot import (BASE_DIR, CALL_STATE_TYPES, Bot, CallConfig, MatrixError)
+from speech import Speech, SpeechConfig, SpeechError, resample
+from triggers import _shell_prefix, format_history, render, write_context_files
+
+#: sample rate we publish at (LiveKit's native Opus rate)
+OUT_RATE = 48000
+FRAME_MS = 20
+
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# membership events: mirror what the caller sent
+# ---------------------------------------------------------------------------
+
+
+def slot_id_of(content: dict) -> str:
+    """The MatrixRTC slot a membership belongs to (``m.call#ROOM``)."""
+    member = content.get("member")
+    if isinstance(member, dict) and isinstance(member.get("slot_id"), str):
+        return member["slot_id"]
+    if isinstance(content.get("slot_id"), str):
+        return content["slot_id"]
+    application = content.get("application")
+    app = application if isinstance(application, str) else "m.call"
+    return f"{app}#{content.get('call_id') or 'ROOM'}"
+
+
+def is_sticky(content: dict) -> bool:
+    """True for the MSC4143 membership shape (``content.member``)."""
+    return isinstance(content.get("member"), dict)
+
+
+def own_membership(template: dict, *, user_id: str, device_id: str,
+                   member_id: str, sfu_url: str = "", service_url: str = "") -> tuple[str, dict]:
+    """Build our membership event from the caller's one.
+
+    Returns ``(state_key, content)``.  Everything that identifies the *other*
+    participant is replaced; the structure (application, slot, intent, …) is
+    copied so both sides speak the same dialect.
+    """
+    content = json.loads(json.dumps(template))          # deep copy
+    for key in ("org.matrix.msc4140.delayed_action",
+                "org.matrix.msc4140.delayed_action_timeout_ms",
+                "org.matrix.msc4140.delayed_action_id",
+                "msc4354_sticky_key"):
+        content.pop(key, None)
+
+    if is_sticky(content):
+        member = dict(content.get("member") or {})
+        member["id"] = member_id
+        member["claimed_user_id"] = user_id
+        member["claimed_device_id"] = device_id
+        member["device_id"] = device_id
+        member["membership"] = "join"
+        if sfu_url:
+            member["transports"] = {"published": [{"type": "livekit", "url": sfu_url}]}
+        member.pop("foci_preferred", None)
+        content["member"] = member
+        return member_id, content
+
+    # MSC3401 session membership (state key is the user id)
+    content["application"] = content.get("application") or "m.call"
+    content["call_id"] = content.get("call_id") or "ROOM"
+    content["device_id"] = device_id
+    if sfu_url:
+        content["foci_preferred"] = [{"type": "livekit", "url": sfu_url}]
+    elif service_url:
+        content["foci_preferred"] = [{"livekit_service_url": service_url}]
+    return user_id, content
+
+
+def left_membership(template: dict, *, user_id: str, device_id: str,
+                    member_id: str) -> tuple[str, dict]:
+    """The withdrawal event that ends our participation."""
+    if is_sticky(template):
+        return member_id, {"member": {
+            "membership": "leave", "id": member_id,
+            "slot_id": slot_id_of(template),
+            "claimed_user_id": user_id, "claimed_device_id": device_id}}
+    return user_id, {}
+
+
+def _rms(data: bytes) -> float:
+    samples = array.array("h", data)
+    if not samples:
+        return 0.0
+    return (sum(s * s for s in samples) / len(samples)) ** 0.5
+
+
+# ---------------------------------------------------------------------------
+# one live call
+# ---------------------------------------------------------------------------
+
+
+class CallSession:
+    """A single answered call in one room (runs its own asyncio loop)."""
+
+    def __init__(self, manager: "CallManager", room_id: str, room_name: str | None,
+                 template: dict, template_type: str):
+        self.mgr = manager
+        self.bot: Bot = manager.bot
+        self.cfg: CallConfig = manager.cfg
+        self.room_id = room_id
+        self.room_name = room_name
+        self.template = template
+        self.template_type = template_type
+        self.member_id = "mw-" + secrets.token_hex(8)
+        self.started = time.monotonic()
+        self.stopping = threading.Event()
+        self.utterances = 0
+        # utterance assembly (energy VAD)
+        self._buf = bytearray()
+        self._speech = 0.0
+        self._silence = 0.0
+        self._in_speech = False
+        self._echo_until = 0.0          # half duplex: ignore input while we speak
+        self._source = None
+        self._thread: threading.Thread | None = None
+        self.tag = f"[call:{self.bot.name}:{room_id[:14]}]"
+
+    # -- lifecycle --------------------------------------------------------------
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._guard,
+                                        name=f"call-{self.room_id[:12]}", daemon=True)
+        self._thread.start()
+
+    def stop(self, reason: str = "stopped") -> None:
+        if not self.stopping.is_set():
+            _log(f"{self.tag} ending call: {reason}")
+        self.stopping.set()
+
+    def _guard(self) -> None:
+        import asyncio
+        try:
+            asyncio.run(self._run())
+        except Exception as exc:  # noqa: BLE001 - a call must never kill the bot
+            _log(f"{self.tag} call failed: {exc!r}")
+        finally:
+            self.stopping.set()
+            self.mgr.session_finished(self)
+
+    # -- the call ---------------------------------------------------------------
+
+    async def _run(self) -> None:
+        import asyncio
+
+        from livekit import rtc
+
+        if self.mgr.speech is None:
+            _log(f"{self.tag} no VOICE_BASE_URL — cannot answer")
+            return
+
+        transports = self.bot.client.rtc_transports()
+        service_url = next((t.get("livekit_service_url") for t in transports
+                            if t.get("livekit_service_url")), "")
+        slot = slot_id_of(self.template)
+        token = self.bot.client.livekit_token(self.room_id, slot, self.member_id)
+        sfu_url = token.get("url") or ""
+        if not sfu_url or not token.get("jwt"):
+            _log(f"{self.tag} the JWT service gave no usable token: {token}")
+            return
+
+        key, content = own_membership(
+            self.template, user_id=self.bot.user_id,
+            device_id=self.bot.client.device_id or "", member_id=self.member_id,
+            sfu_url=sfu_url, service_url=service_url)
+        try:
+            self.bot.client.send_state(self.room_id, self.template_type, key, content)
+        except MatrixError as exc:
+            _log(f"{self.tag} publishing call membership failed: {exc} "
+                 "(the bot needs power level >= 50 in this room)")
+            return
+        _log(f"{self.tag} joined {self.template_type} slot {slot} via {sfu_url}")
+
+        room = rtc.Room()
+        source = rtc.AudioSource(OUT_RATE, 1)
+        self._source = source
+        track = rtc.LocalAudioTrack.create_audio_track("mw-voice", source)
+        incoming: asyncio.Queue = asyncio.Queue()
+
+        @room.on("track_subscribed")
+        def _(tr, publication, participant):
+            if tr.kind == rtc.TrackKind.KIND_AUDIO:
+                incoming.put_nowait((tr, participant.identity))
+
+        try:
+            await room.connect(sfu_url, token["jwt"])
+            _log(f"{self.tag} livekit room {room.name}: "
+                 f"{[p.identity for p in room.remote_participants.values()]}")
+            await room.local_participant.publish_track(track)
+
+            tasks = [asyncio.create_task(self._pump_incoming(incoming)),
+                     asyncio.create_task(self._refresh_membership())]
+            if self.cfg.greeting:
+                tasks.append(asyncio.create_task(self._speak(self.cfg.greeting)))
+            deadline = self.started + self.cfg.max_seconds
+            while not self.stopping.is_set():
+                if time.monotonic() > deadline:
+                    _log(f"{self.tag} max_seconds reached")
+                    break
+                await asyncio.sleep(0.5)
+            for t in tasks:
+                t.cancel()
+        finally:
+            try:
+                key, leave = left_membership(
+                    self.template, user_id=self.bot.user_id,
+                    device_id=self.bot.client.device_id or "", member_id=self.member_id)
+                self.bot.client.send_state(self.room_id, self.template_type, key, leave)
+            except MatrixError as exc:
+                _log(f"{self.tag} withdrawing membership failed: {exc}")
+            try:
+                await room.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            _log(f"{self.tag} left ({self.utterances} utterance(s) handled)")
+
+    async def _refresh_membership(self) -> None:
+        """Re-PUT our membership so it never looks stale to other clients."""
+        import asyncio
+        while not self.stopping.is_set():
+            await asyncio.sleep(120)
+            try:
+                key, content = own_membership(
+                    self.template, user_id=self.bot.user_id,
+                    device_id=self.bot.client.device_id or "", member_id=self.member_id)
+                self.bot.client.send_state(self.room_id, self.template_type, key, content)
+            except Exception as exc:  # noqa: BLE001
+                _log(f"{self.tag} membership refresh failed: {exc}")
+
+    # -- listening ---------------------------------------------------------------
+
+    async def _pump_incoming(self, incoming: asyncio.Queue) -> None:
+        """Read every subscribed audio track and cut it into utterances."""
+        import asyncio
+
+        from livekit import rtc
+
+        while not self.stopping.is_set():
+            try:
+                track, who = await asyncio.wait_for(incoming.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            _log(f"{self.tag} audio track from {who}")
+            try:
+                stream = rtc.AudioStream(track, sample_rate=OUT_RATE, num_channels=1)
+                async for event in stream:
+                    if self.stopping.is_set():
+                        break
+                    self._feed(event.frame)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                _log(f"{self.tag} audio stream from {who} ended: {exc!r}")
+
+    def _feed(self, frame) -> None:
+        """Energy VAD: buffer speech, hand complete utterances to the agent."""
+        import asyncio
+
+        if time.monotonic() < self._echo_until:
+            self._buf.clear()
+            self._in_speech, self._speech, self._silence = False, 0.0, 0.0
+            return
+
+        dur = frame.samples_per_channel / OUT_RATE
+        if _rms(frame.data) >= self.cfg.vad_threshold:
+            self._in_speech = True
+            self._speech += dur
+            self._silence = 0.0
+            self._buf.extend(frame.data)
+            if self._speech >= self.cfg.max_utterance:
+                _log(f"{self.tag} utterance hit max_utterance; cutting")
+                self._flush()
+            return
+
+        if not self._in_speech:
+            return
+        self._buf.extend(frame.data)            # keep the trailing word
+        self._silence += dur
+        if self._silence >= self.cfg.silence_end:
+            self._flush()
+
+    def _flush(self) -> None:
+        """Hand the buffered utterance to the answering pipeline."""
+        import asyncio
+
+        pcm, speech = bytes(self._buf), self._speech
+        self._buf = bytearray()
+        self._in_speech, self._speech, self._silence = False, 0.0, 0.0
+        if speech < self.cfg.min_speech or len(pcm) < OUT_RATE // 4:
+            return
+        _log(f"{self.tag} utterance {speech:.1f}s -> stt")
+        asyncio.create_task(self._answer(pcm))
+
+    # -- answering ----------------------------------------------------------------
+
+    async def _answer(self, pcm: bytes) -> None:
+        """stt -> command -> tts -> publish, one utterance at a time."""
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        try:
+            text = await loop.run_in_executor(
+                None, lambda: self.mgr.speech.transcribe(pcm, OUT_RATE, self.cfg.language))
+        except SpeechError as exc:
+            _log(f"{self.tag} {exc}")
+            return
+        if not text:
+            return
+        _log(f"{self.tag} heard: {text[:120]}")
+        self.utterances += 1
+        fut = loop.run_in_executor(None, self._run_command, text)
+        if self.cfg.thinking_cue:
+            done, _ = await asyncio.wait({fut}, timeout=self.cfg.cue_after)
+            if not done and not self.stopping.is_set():
+                await self._speak(self.cfg.thinking_cue)
+        answer = await fut
+        if answer:
+            await self._speak(answer)
+        if self.cfg.log_transcripts:
+            await loop.run_in_executor(None, self._log_to_room, text, answer)
+
+    def _log_to_room(self, heard: str, answer: str) -> None:
+        """Keep a written record of the call in the room itself."""
+        body = f"📞 {heard}" + (f"\n🤖 {answer}" if answer else "")
+        try:
+            self.bot.client.send_message(self.room_id, {"msgtype": "m.text", "body": body})
+        except MatrixError as exc:
+            _log(f"{self.tag} writing the call record to the room failed: {exc}")
+
+    async def _speak(self, text: str) -> None:
+        import asyncio
+
+        from livekit import rtc
+
+        if self._source is None:
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            pcm, rate = await loop.run_in_executor(None, self.mgr.speech.synthesize, text)
+        except SpeechError as exc:
+            _log(f"{self.tag} {exc}")
+            return
+        pcm = resample(pcm, rate, OUT_RATE)
+        seconds = len(pcm) / 2 / OUT_RATE
+        _log(f"{self.tag} speaking {seconds:.1f}s: {text[:100]}")
+        self._echo_until = time.monotonic() + seconds + 0.5
+        size = int(OUT_RATE * FRAME_MS / 1000) * 2
+        for i in range(0, len(pcm), size):
+            if self.stopping.is_set():
+                return
+            chunk = pcm[i:i + size]
+            await self._source.capture_frame(
+                rtc.AudioFrame(chunk, OUT_RATE, 1, len(chunk) // 2))
+            while self._source.queued_duration > 1000:
+                await asyncio.sleep(0.05)
+
+    def _run_command(self, transcript: str) -> str:
+        """Run the configured command(s); the last one's stdout is the answer."""
+        if not self.cfg.commands:
+            return ""
+        try:
+            history = self.bot.client.read_messages(self.room_id, limit=self.cfg.context,
+                                                    crypto=self.bot.crypto)
+        except MatrixError as exc:
+            _log(f"{self.tag} reading history failed: {exc}")
+            history = []
+        new_message = {"sender": "you", "ts": int(time.time() * 1000), "body": transcript}
+        values = {
+            "channel": self.room_name or self.room_id,
+            "room": self.room_id,
+            "sender": "you",
+            "msg": format_history([*history, new_message]),
+            "transcript": transcript,
+        }
+        values["message_file"], values["history_file"] = write_context_files(
+            self.room_id, self.room_name, new_message, [*history, new_message])
+        env = dict(os.environ,
+                   MATRIX_BOT=self.bot.name, MATRIX_ROOM=self.room_id,
+                   MATRIX_CHANNEL=self.room_name or self.room_id,
+                   MATRIX_CALL="1", MCP_BOT=self.bot.name)
+        out = ""
+        try:
+            for command in self.cfg.commands:
+                cmdline = render(command, values)
+                _log(f"{self.tag} run: {cmdline[:200]}")
+                proc = subprocess.Popen(_shell_prefix() + [cmdline], env=env,
+                                        cwd=str(BASE_DIR), stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True,
+                                        start_new_session=True)
+                stdout, stderr = proc.communicate()
+                if proc.returncode != 0:
+                    _log(f"{self.tag} exit {proc.returncode}: "
+                         f"{str(stderr or stdout)[-300:]}")
+                out = (stdout or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            _log(f"{self.tag} command failed: {exc!r}")
+        finally:
+            shutil.rmtree(str(Path(values["message_file"]).parent), ignore_errors=True)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# per-bot manager
+# ---------------------------------------------------------------------------
+
+
+class CallManager:
+    """Watches a bot's rooms for calls and keeps one CallSession per room."""
+
+    def __init__(self, bot: Bot, cfg: CallConfig, on_log=None):
+        self.bot = bot
+        self.cfg = cfg
+        self.on_log = on_log or _log
+        speech_cfg = SpeechConfig.from_env()
+        self.speech = Speech(speech_cfg, on_log=on_log) if speech_cfg else None
+        self._sessions: dict[str, CallSession] = {}
+        self._members: dict[str, set[str]] = {}
+        self._lock = threading.Lock()
+
+    # -- entry points ------------------------------------------------------------
+
+    def on_state_event(self, ev: dict) -> None:
+        """Feed one changed room-state event (from /sync) into the manager."""
+        if not self.cfg.enabled or ev.get("type") not in CALL_STATE_TYPES:
+            return
+        room_id = ev.get("room_id") or ""
+        sender = ev.get("sender")
+        if not room_id or sender == self.bot.user_id:
+            return
+        if not self.cfg.matches(room_id, ev.get("room_name")):
+            return
+
+        if ev["type"] == "org.matrix.msc4143.rtc.slot":
+            if (ev.get("content") or {}).get("status") == "closed":
+                self.stop_room(room_id, "call slot closed")
+            return
+
+        content = ev.get("content") or {}
+        left = not content or (is_sticky(content)
+                               and content["member"].get("membership") == "leave")
+        if left:
+            self._forget_membership(room_id, sender)
+            if not self._members.get(room_id):
+                self.stop_room(room_id, "everyone left")
+            return
+
+        self._members.setdefault(room_id, set()).add(sender)
+        self.join(room_id, ev.get("room_name"), content, ev["type"])
+
+    def poll_rooms(self) -> None:
+        """Find calls that are already running (e.g. after a restart)."""
+        if not self.cfg.enabled:
+            return
+        try:
+            rooms = self.bot.client.list_rooms()
+        except MatrixError as exc:
+            self.on_log(f"[call:{self.bot.name}] listing rooms failed: {exc}")
+            return
+        for room in rooms:
+            room_id = room["room_id"]
+            if not self.cfg.matches(room_id, room.get("name")):
+                continue
+            try:
+                events = self.bot.client.room_state(room_id, CALL_STATE_TYPES)
+            except MatrixError:
+                continue
+            for ev in events:
+                self.on_state_event({"room_id": room_id, "room_name": room.get("name"),
+                                     "type": ev.get("type"),
+                                     "state_key": ev.get("state_key"),
+                                     "sender": ev.get("sender"),
+                                     "content": ev.get("content") or {}})
+
+    def join(self, room_id: str, room_name: str | None, content: dict,
+             event_type: str) -> None:
+        with self._lock:
+            if room_id in self._sessions:
+                return
+            session = CallSession(self, room_id, room_name, content, event_type)
+            self._sessions[room_id] = session
+        if self.speech is None:
+            self.on_log(f"[call:{self.bot.name}] VOICE_BASE_URL is not set — "
+                        "cannot answer calls")
+            self._drop(room_id)
+            return
+        try:
+            import livekit  # noqa: F401 - optional dependency
+        except ImportError:
+            self.on_log(f"[call:{self.bot.name}] the 'livekit' package is missing — "
+                        "cannot answer calls (pip install livekit)")
+            self._drop(room_id)
+            return
+        self.on_log(f"[call:{self.bot.name}] call in {room_name or room_id}: joining")
+        session.start()
+
+    def _drop(self, room_id: str) -> None:
+        with self._lock:
+            self._sessions.pop(room_id, None)
+
+    def stop_room(self, room_id: str, reason: str = "stopped") -> None:
+        with self._lock:
+            session = self._sessions.get(room_id)
+        if session:
+            session.stop(reason)
+
+    def stop_all(self, reason: str = "shutdown") -> None:
+        with self._lock:
+            sessions = list(self._sessions.values())
+        for s in sessions:
+            s.stop(reason)
+
+    def status(self) -> list[dict]:
+        with self._lock:
+            sessions = list(self._sessions.values())
+        return [{"room": s.room_id, "seconds": round(time.monotonic() - s.started),
+                 "utterances": s.utterances} for s in sessions]
+
+    def session_finished(self, session: CallSession) -> None:
+        with self._lock:
+            if self._sessions.get(session.room_id) is session:
+                self._sessions.pop(session.room_id, None)
+
+    def _forget_membership(self, room_id: str, sender: str | None) -> None:
+        if sender:
+            self._members.setdefault(room_id, set()).discard(sender)

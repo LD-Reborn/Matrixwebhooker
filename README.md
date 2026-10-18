@@ -215,6 +215,61 @@ whole rule: a sentence that merely starts with "stop" such as
 > as a trigger, make sure it runs the work in-process (not in a shared
 > daemon) or `stop` has the same problem.
 
+## Voice calls (MatrixRTC / Element Call)
+
+A bot can answer the calls your Matrix client places in a room: it joins the
+call, listens, and answers out loud.
+
+```
+you ──WebRTC──▶ LiveKit SFU ──▶ bot: whisper (STT) ──▶ your command ──▶ TTS ──▶ you
+```
+
+Per bot in `bots.json` (needs `requirements-call.txt` installed and the
+`VOICE_*` settings in `.env` — see `.env.example`):
+
+```json
+"call": {
+  "enabled": true,
+  "command": "opencode run --standalone -m … \"…: {{transcript}}\"",
+  "greeting": "Hallo, ich bin der Bot.",
+  "rooms": ["Some Room"],        // optional; default: every room the bot is in
+  "max_seconds": 600,
+  "language": "de"
+}
+```
+
+What has to be true for a call to work:
+
+- **Your client places MatrixRTC calls** (Element Call — the default in
+  current Element). The homeserver advertises the LiveKit transport in
+  `.well-known` (`org.matrix.msc4143.rtc_foci`) and Synapse needs
+  `msc4143_enabled` + a JWT service.
+- **Power level ≥ 50 in that room — for you *and* the bot.** Starting or
+  joining a call means sending a call-membership *state* event, and
+  `state_default` is 50. Greyed-out call buttons in a room where you sit at
+  `users_default: 0` come from exactly this (rooms an old bot account created:
+  `_fix_power_levels.py` repairs them).
+- The bot mirrors the membership shape the caller used
+  (`org.matrix.msc3401.call.member` or `org.matrix.msc4143.rtc.member`),
+  exchanges an OpenID token for a LiveKit JWT at the homeserver's JWT service
+  and joins the SFU. No TURN server is needed — media goes through the SFU.
+
+How it behaves:
+
+- Each utterance (energy VAD: `vad_threshold`, `silence_end`, `min_speech`,
+  `max_utterance`) is sent to whisper. The command gets the usual placeholders
+  plus **`{{transcript}}`**, and its **stdout is what gets spoken** — keep
+  answers short, TTS costs roughly 3× the audio length. While the bot speaks it
+  ignores incoming audio (half duplex, no self-answering).
+- A bare `stop` in the room hangs the call up; so does the last other
+  participant leaving, the MatrixRTC slot closing, or `max_seconds`.
+- `GET /health` lists the active calls per bot.
+- No client needed to test it: `python3 _call_selftest.py` runs a fake caller
+  against the real code in a throw-away room the bot creates itself.
+- Media encryption: the bot joins the SFU without MatrixRTC media keys, so
+  calls work in rooms **without** end-to-end encryption (which is also what
+  the rest of this bridge assumes).
+
 ## API
 
 Auth header for every request: `X-API-Key: <api_key of the bot>` (or

@@ -55,6 +55,22 @@ except ConfigError as exc:
 
 BOTS: dict[str, Bot] = {cfg.name: Bot(cfg, settings) for cfg in settings.bots}
 
+# Voice calls (MatrixRTC / Element Call): only for bots that enable them.
+try:
+    from calls import CallManager
+except ImportError as exc:                      # pragma: no cover
+    CallManager = None
+    _CALL_IMPORT_ERROR = exc
+else:
+    _CALL_IMPORT_ERROR = None
+for _bot in BOTS.values():
+    if _bot.cfg.call.enabled:
+        if CallManager is None:
+            print(f"WARNING: bot '{_bot.name}' has calls enabled but the call "
+                  f"support cannot be imported: {_CALL_IMPORT_ERROR}", file=sys.stderr)
+        else:
+            _bot.calls = CallManager(_bot, _bot.cfg.call)
+
 #: Pending reply waiters (POST /wait); incoming messages matching a waiter
 #: are delivered there and are NOT fired as triggers.
 WAITERS = WaitRegistry()
@@ -236,9 +252,11 @@ def main() -> None:
     watchers: list[MessageWatcher] = []
     for bot in BOTS.values():
         trig = [t.room for t in bot.cfg.triggers]
+        call = (f"call=on({len(bot.cfg.call.commands)} cmd)" if bot.cfg.call.enabled
+                else "call=off")
         print(f"bot: {bot.name} ({bot.user_id}) "
               f"room={bot.room_id_cached_or_pinned() or '(resolved on first use)'} "
-              f"triggers=[{', '.join(trig) or 'none'}]")
+              f"triggers=[{', '.join(trig) or 'none'}] {call}")
         w = MessageWatcher(bot, WAITERS)
         w.start()
         watchers.append(w)

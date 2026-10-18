@@ -63,6 +63,92 @@ class Trigger:
 
 
 @dataclass
+class CallConfig:
+    """Answering MatrixRTC (Element Call) calls — ``bots.json`` -> ``"call"``.
+
+    ``commands`` are bash command line(s) run per heard utterance; the last
+    one's stdout is what the bot speaks back.  On top of the trigger
+    placeholders they also get ``{{transcript}}`` (what was heard).
+    ``rooms`` restricts which rooms the bot joins calls in (display names or
+    ``!…`` ids); empty means every room the bot is a member of.
+    """
+    enabled: bool = False
+    commands: list[str] = field(default_factory=list)
+    context: int = 25
+    rooms: list[str] = field(default_factory=list)
+    max_seconds: int = 900
+    greeting: str = ""
+    language: str = ""
+    thinking_cue: str = "Einen Moment."   # spoken while the command is still running
+    cue_after: float = 4.0                # seconds before that cue
+    log_transcripts: bool = True          # post heard + answer into the room
+    vad_threshold: int = 400        # rms of 16-bit pcm that counts as speech
+    silence_end: float = 0.9        # seconds of silence closing an utterance
+    min_speech: float = 0.35        # shorter blips are dropped
+    max_utterance: float = 20.0     # seconds before an utterance is cut off
+
+    def matches(self, room_id: str, room_name: str | None) -> bool:
+        if not self.rooms:
+            return True
+        for want in self.rooms:
+            if want.startswith("!"):
+                if want.casefold() == room_id.casefold():
+                    return True
+            elif room_name and want.casefold() == room_name.casefold():
+                return True
+        return False
+
+
+def call_config_from(entry: dict, path: Path) -> CallConfig:
+    """Parse the optional ``"call"`` object of a bots.json entry."""
+    raw = entry.get("call")
+    if raw is None:
+        return CallConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: bots[{entry.get('name')}] 'call' must be an object")
+    cmd = raw.get("command", raw.get("commands"))
+    if isinstance(cmd, str):
+        commands = [cmd]
+    elif isinstance(cmd, list):
+        commands = [str(c) for c in cmd]
+    else:
+        commands = []
+    rooms = raw.get("rooms") or []
+    if not isinstance(rooms, list):
+        raise ConfigError(f"{path}: 'call.rooms' must be a list of room names/ids")
+    try:
+        context = int(raw.get("context", 25))
+        max_seconds = int(raw.get("max_seconds", 900))
+        vad = int(raw.get("vad_threshold", 400))
+        silence_end = float(raw.get("silence_end", 0.9))
+        min_speech = float(raw.get("min_speech", 0.35))
+        max_utterance = float(raw.get("max_utterance", 20.0))
+        cue_after = float(raw.get("cue_after", 4.0))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{path}: 'call': numeric setting is not a number: {exc}") from exc
+    if not 1 <= context <= 100:
+        raise ConfigError(f"{path}: 'call.context' must be between 1 and 100")
+    if not 30 <= max_seconds <= 7200:
+        raise ConfigError(f"{path}: 'call.max_seconds' must be between 30 and 7200")
+    return CallConfig(
+        enabled=bool(raw.get("enabled", True)),
+        commands=commands,
+        context=context,
+        rooms=[str(r) for r in rooms],
+        max_seconds=max_seconds,
+        greeting=str(raw.get("greeting") or ""),
+        language=str(raw.get("language") or ""),
+        thinking_cue=str(raw.get("thinking_cue", "Einen Moment.")),
+        cue_after=cue_after,
+        log_transcripts=bool(raw.get("log_transcripts", True)),
+        vad_threshold=vad,
+        silence_end=silence_end,
+        min_speech=min_speech,
+        max_utterance=max_utterance,
+    )
+
+
+@dataclass
 class BotConfig:
     name: str                       # label; also used for the state subdir
     user: str                       # Matrix localpart (no @, no domain)
@@ -71,6 +157,7 @@ class BotConfig:
     room_id: str | None = None      # pinned room; null = remember/cache/auto-create
     room_name: str | None = None    # name for the auto-created room
     triggers: list[Trigger] = field(default_factory=list)
+    call: CallConfig = field(default_factory=CallConfig)
 
 
 @dataclass
@@ -177,6 +264,7 @@ def load_settings() -> Settings:
             room_id=room_id,
             room_name=str(entry.get("room_name") or "").strip() or None,
             triggers=triggers,
+            call=call_config_from(entry, path),
         ))
 
     return Settings(
@@ -206,6 +294,19 @@ class MatrixError(RuntimeError):
         self.payload = payload
         detail = payload.get("error", payload) if isinstance(payload, dict) else payload
         super().__init__(f"HTTP {status}: {detail}")
+
+
+#: Room-state event types that tell us a MatrixRTC call is running.  Element
+#: Call has used three shapes so far: the MSC3401 session membership (state
+#: key = user id), the newer MSC4143 MatrixRTC membership (sticky, state key =
+#: member id) and, oldest, the im.element.call.member widget convention.  The
+#: slot event is watched too: closing it ends a call.
+CALL_STATE_TYPES = (
+    "org.matrix.msc3401.call.member",
+    "org.matrix.msc4143.rtc.member",
+    "im.element.call.member",
+    "org.matrix.msc4143.rtc.slot",
+)
 
 
 def _safe_json(resp: requests.Response):
@@ -386,12 +487,14 @@ class Matrix:
     def sync(self, since: str | None = None, timeout_ms: int = 30000) -> dict:
         """One (long-polling) /sync round trip.
 
-        Returns ``{"next_batch": ..., "events": [...], "to_device": [...]}``.
-        Events are the *new* m.room.message / m.room.encrypted events of the
-        joined rooms (oldest first, per room), each with ``room_id``,
-        ``room_name``, ``event_id``, ``sender``, ``ts`` and, for plaintext
-        ones, ``msgtype``/``body``; encrypted ones carry ``raw`` (Megolm
-        material) for decryption by ``Bot.crypto``. ``to_device`` holds the
+        Returns ``{"next_batch": ..., "events": [...], "state": [...],
+        "to_device": [...]}``. Events are the *new* m.room.message /
+        m.room.encrypted events of the joined rooms (oldest first, per room),
+        each with ``room_id``, ``room_name``, ``event_id``, ``sender``, ``ts``
+        and, for plaintext ones, ``msgtype``/``body``; encrypted ones carry
+        ``raw`` (Megolm material) for decryption by ``Bot.crypto``. ``state``
+        holds *changed* room state of interest (room name plus the MatrixRTC
+        call-membership events, see CALL_STATE_TYPES). ``to_device`` holds the
         raw to-device events (Olm/Megolm key material). A call without
         ``since`` is a snapshot: its events are historical and the caller
         must not act on them.
@@ -399,7 +502,8 @@ class Matrix:
         flt = json.dumps(
             {"room": {
                 "timeline": {"types": ["m.room.message", "m.room.encrypted"], "limit": 100},
-                "state": {"types": ["m.room.name", "m.room.canonical_alias"]},
+                "state": {"types": ["m.room.name", "m.room.canonical_alias",
+                                    *CALL_STATE_TYPES]},
             },
              "to_device": {"types": ["*"]}},
             separators=(",", ":"))
@@ -414,6 +518,7 @@ class Matrix:
             "GET", f"{self.hs}/_matrix/client/v3/sync",
             params=params, timeout=max(1.0, timeout_ms / 1000.0 + 10.0))
         events: list[dict] = []
+        state: list[dict] = []
         for room_id, rdata in (data.get("rooms", {}).get("join", {}) or {}).items():
             name = (rdata.get("name") or {}).get("name")
             if not name:
@@ -453,11 +558,112 @@ class Matrix:
                     entry["msgtype"] = content.get("msgtype", "m.text")
                     entry["body"] = body
                 events.append(entry)
+            for se in ((rdata.get("state", {}) or {}).get("events", [])) or []:
+                if se.get("type") not in CALL_STATE_TYPES:
+                    continue
+                state.append({
+                    "room_id": room_id,
+                    "room_name": name,
+                    "type": se.get("type"),
+                    "state_key": se.get("state_key"),
+                    "sender": se.get("sender"),
+                    "ts": se.get("origin_server_ts"),
+                    "content": se.get("content") or {},
+                })
         return {
             "next_batch": data.get("next_batch"),
             "events": events,
+            "state": state,
             "to_device": (data.get("to_device", {}) or {}).get("events", []),
         }
+
+    # -- room state (MatrixRTC calls) ------------------------------------------
+
+    def send_state(self, room_id: str, event_type: str, state_key: str,
+                   content: dict) -> dict:
+        """PUT a room state event (used to publish our call membership)."""
+        url = (f"{self.hs}/_matrix/client/v3/rooms/{quote(room_id, safe='')}/state/"
+               f"{quote(event_type, safe='')}/{quote(state_key, safe='')}")
+        return self._request("PUT", url, content)
+
+    def room_state(self, room_id: str, types: tuple[str, ...] | None = None) -> list[dict]:
+        """Current room state events (optionally only the given types)."""
+        events = self._request("GET", f"{self.hs}/_matrix/client/v3/rooms/"
+                                      f"{quote(room_id, safe='')}/state")
+        if not isinstance(events, list):
+            return []
+        if types is None:
+            return events
+        return [ev for ev in events if ev.get("type") in types]
+
+    # -- MatrixRTC / LiveKit -----------------------------------------------------
+
+    def rtc_transports(self) -> list[dict]:
+        """LiveKit transports the homeserver advertises (MSC4143 endpoint,
+        falling back to the .well-known rtc_foci)."""
+        try:
+            data = self._request(
+                "GET", f"{self.hs}/_matrix/client/unstable/org.matrix.msc4143/rtc/transports")
+            transports = [t for t in (data.get("rtc_transports") or [])
+                          if isinstance(t, dict)]
+            if transports:
+                return transports
+        except MatrixError:
+            pass
+        try:
+            well = self._plain_request(
+                "GET", f"{self.hs}/.well-known/matrix/client")
+        except MatrixError:
+            return []
+        foci = (well.get("org.matrix.msc4143.rtc_foci")
+                or well.get("org.matrix.msc3266.rtc_foci") or [])
+        return [f for f in foci if isinstance(f, dict)]
+
+    def openid_token(self) -> dict:
+        """Short-lived OpenID token the LiveKit JWT service validates."""
+        return self._request(
+            "POST", f"{self.hs}/_matrix/client/v3/user/"
+                    f"{quote(self.user_id, safe='')}/openid/request_token",
+            {"access_token": self.token})
+
+    def livekit_token(self, room_id: str, slot_id: str, member_id: str) -> dict:
+        """-> ``{"url": "wss://…/sfu", "jwt": "…"}`` for one call slot.
+
+        Uses the JWT service advertised by the homeserver (MSC4195
+        ``/get_token``; the older ``/sfu/get`` is tried as a fallback).
+        """
+        transports = self.rtc_transports()
+        service = next((t.get("livekit_service_url") for t in transports
+                        if t.get("livekit_service_url")), None)
+        sfu = next((t.get("url") for t in transports if t.get("url")), None)
+        if not service and not sfu:
+            raise MatrixError(0, "homeserver advertises no livekit transport "
+                                 "(.well-known org.matrix.msc4143.rtc_foci)")
+        if not service:
+            # SFU url only: the homeserver itself issues the token (MSC4195).
+            data = self._request(
+                "POST", f"{self.hs}/_matrix/client/unstable/io.element.msc4195"
+                        f"/rtc/livekit/get_token",
+                {"url": sfu, "room_id": room_id, "slot_id": slot_id,
+                 "member_id": member_id})
+            return {"url": sfu, "jwt": data.get("jwt", "")}
+        body = {
+            "room_id": room_id,
+            "slot_id": slot_id,
+            "openid_token": self.openid_token(),
+            "member": {"id": member_id, "claimed_user_id": self.user_id,
+                       "claimed_device_id": self.device_id or ""},
+        }
+        last: MatrixError | None = None
+        for path in ("/get_token", "/sfu/get"):
+            try:
+                data = self._request("POST", service.rstrip("/") + path, body)
+            except MatrixError as exc:
+                last = exc
+                continue
+            if data.get("jwt"):
+                return {"url": data.get("url") or sfu or "", "jwt": data["jwt"]}
+        raise last or MatrixError(0, f"livekit token request failed at {service}")
 
     def get_room_name(self, room_id: str) -> str | None:
         """Current m.room.name of the room (None if it has no name / no access)."""
@@ -579,6 +785,8 @@ class Bot:
         state_dir.mkdir(parents=True, exist_ok=True)
         self.client = Matrix(settings.homeserver, cfg.user, cfg.password, state_dir)
         self._crypto: BotCrypto | None = None
+        #: set by server.py when the bot has "call" enabled (calls.CallManager)
+        self.calls = None
 
     @property
     def name(self) -> str:
@@ -626,9 +834,13 @@ class Bot:
         return room_id
 
     def status(self) -> dict:
-        return {
+        out = {
             "name": self.name,
             "user": self.user_id,
             "connected": self.client.token is not None,
             "room": self.room_id_cached_or_pinned(),
         }
+        if self.calls is not None:
+            out["call_enabled"] = self.cfg.call.enabled
+            out["calls"] = self.calls.status()
+        return out

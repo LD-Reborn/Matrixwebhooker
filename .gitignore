@@ -10,3 +10,5 @@ __pycache__/
 .venv/
 venv/
 example_bot/
+.selftest_room
+selftest-answer.wav

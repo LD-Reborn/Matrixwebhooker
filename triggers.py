@@ -440,6 +440,11 @@ class MessageWatcher:
 
     def start(self) -> None:
         self._load_key_pending()
+        calls = getattr(self.bot, "calls", None)
+        if calls is not None:
+            # a call may already be running (we restarted mid-call)
+            threading.Thread(target=calls.poll_rooms,
+                             name=f"callpoll-{self.bot.name}", daemon=True).start()
         self._thread = threading.Thread(target=self._run,
                                         name=f"watch-{self.bot.name}", daemon=True)
         self._thread.start()
@@ -510,6 +515,8 @@ class MessageWatcher:
         to_device = result.get("to_device") or []
         if to_device:
             self._ingest_todevice(to_device)
+        for ev in result.get("state") or []:
+            self._on_state(ev)
         # The key failed events were waiting for may have just arrived —
         # retry them before processing the fresh timeline events.
         events = self._retry_pending_keys() + self._decrypt_events(
@@ -519,6 +526,16 @@ class MessageWatcher:
         _log(f"{self.tag} +{len(events)} message(s)")
         for ev in events:
             self._handle(ev)
+
+    def _on_state(self, ev: dict) -> None:
+        """Room state changes: hand call membership events to the CallManager."""
+        calls = getattr(self.bot, "calls", None)
+        if calls is None:
+            return
+        try:
+            calls.on_state_event(ev)
+        except Exception as exc:  # noqa: BLE001 - state handling must not kill the loop
+            _log(f"{self.tag} call state handling failed: {exc!r}")
 
     def _ingest_todevice(self, events: list[dict]) -> None:
         """Feed to-device (Olm/Megolm) events into the bot's crypto layer.
@@ -628,8 +645,8 @@ class MessageWatcher:
             _log(f"{self.tag} sending stop acknowledgment failed: {exc}")
 
     def _stop_room(self, room_id: str, where: str) -> None:
-        """Handle a bare "stop" in ``room_id``: kill the run, release waiters
-        and clean up the wrench reactions."""
+        """Handle a bare "stop" in ``room_id``: kill the run, release waiters,
+        leave any call and clean up the wrench reactions."""
         key = room_id.casefold()
         with self._session_lock:
             active = list(self._sessions.get(key, []))
@@ -638,15 +655,21 @@ class MessageWatcher:
             self._kill_running(sess)
             self._clean_up(sess)
         cancelled = self.waiters.cancel(self.bot.name, room_id)
+        calls = getattr(self.bot, "calls", None)
+        hung_up = calls is not None and room_id in [s["room"] for s in calls.status()]
+        if hung_up:
+            calls.stop_room(room_id, "stop command")
         if active:
             ack = "⏹ Stopped."
         elif cancelled:
             ack = "⏹ Stop sent (waiting model released)."
+        elif hung_up:
+            ack = "⏹ Left the call."
         else:
             ack = "⏹ Nothing was running."
         self._ack_stop(room_id, ack)
         _log(f"{self.tag} {where} -> stopped: {len(active)} run(s), "
-             f"{cancelled} waiter(s) released")
+             f"{cancelled} waiter(s) released, call left={hung_up}")
 
     # -- per-message pipeline ---------------------------------------------------
 

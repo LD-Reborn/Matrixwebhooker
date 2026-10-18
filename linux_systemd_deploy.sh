@@ -109,6 +109,17 @@ create_venv() {
     || fail "dependencies installed but 'import olm' fails — python-olm incompatible with this venv"
 }
 
+install_call_deps() {  # optional: voice calls (MatrixRTC / Element Call)
+  [ -f requirements-call.txt ] || return 0
+  local uv_bin
+  echo "Installing voice-call dependencies (requirements-call.txt) ..."
+  if uv_bin=$(find_uv); then
+    "$uv_bin" pip install --python "$VENV/bin/python" -q -r requirements-call.txt
+  else
+    "$VENV/bin/python" -m pip install --quiet -r requirements-call.txt
+  fi
+}
+
 if venv_is_ok; then
   echo "Reusing existing virtualenv at $VENV (Python 3.$WANT_PY_MINOR, olm OK) ..."
 elif [ -e "$VENV" ]; then
@@ -118,6 +129,7 @@ elif [ -e "$VENV" ]; then
 else
   create_venv
 fi
+install_call_deps
 # deployed via root/sudo would leave the venv root-owned — hand it to the
 # service user so the running service can maintain it
 if [ "$(id -u)" -eq 0 ]; then
