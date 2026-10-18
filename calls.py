@@ -51,8 +51,13 @@ def _log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def slot_id_of(content: dict) -> str:
-    """The MatrixRTC slot a membership belongs to (``m.call#ROOM``)."""
+def slot_id_of(template: dict) -> str:
+    """The MatrixRTC slot the caller's membership sits in (``m.call#<call_id>``).
+
+    The SFU room name is derived from this, so an invented call id puts us in a
+    different LiveKit room than the caller.
+    """
+    content = template.get("content") or {}
     member = content.get("member")
     if isinstance(member, dict) and isinstance(member.get("slot_id"), str):
         return member["slot_id"]
@@ -60,7 +65,7 @@ def slot_id_of(content: dict) -> str:
         return content["slot_id"]
     application = content.get("application")
     app = application if isinstance(application, str) else "m.call"
-    return f"{app}#{content.get('call_id') or 'ROOM'}"
+    return f"{app}#{content.get('call_id', 'ROOM')}"
 
 
 def is_sticky(content: dict) -> bool:
@@ -68,15 +73,21 @@ def is_sticky(content: dict) -> bool:
     return isinstance(content.get("member"), dict)
 
 
-def own_membership(template: dict, *, user_id: str, device_id: str,
-                   member_id: str, sfu_url: str = "", service_url: str = "") -> tuple[str, dict]:
-    """Build our membership event from the caller's one.
+def own_membership(template: dict, *, user_id: str, device_id: str, member_id: str,
+                   sfu_url: str = "", service_url: str = "") -> tuple[str, dict]:
+    """Our membership event, mirroring the caller's whole event.
 
-    Returns ``(state_key, content)``.  Everything that identifies the *other*
-    participant is replaced; the structure (application, slot, intent, …) is
-    copied so both sides speak the same dialect.
+    Returns ``(state_key, content)``.  Only the identity fields are swapped —
+    application, call id, scope, intent, foci and expiry are copied, and the
+    state key keeps the caller's shape (current Element Call uses
+    ``_@user_device_m.call``, not the bare user id).  That matters: Element
+    Call matches LiveKit participants against ``membershipID``/the state key,
+    so a copied or mismatched identity means the other side never hears us.
     """
-    content = json.loads(json.dumps(template))          # deep copy
+    content = json.loads(json.dumps(template.get("content") or {}))
+    sender = template.get("sender") or ""
+    their_device = content.get("device_id") or ""
+
     for key in ("org.matrix.msc4140.delayed_action",
                 "org.matrix.msc4140.delayed_action_timeout_ms",
                 "org.matrix.msc4140.delayed_action_id",
@@ -90,32 +101,45 @@ def own_membership(template: dict, *, user_id: str, device_id: str,
         member["claimed_device_id"] = device_id
         member["device_id"] = device_id
         member["membership"] = "join"
-        if sfu_url:
-            member["transports"] = {"published": [{"type": "livekit", "url": sfu_url}]}
         member.pop("foci_preferred", None)
         content["member"] = member
         return member_id, content
 
-    # MSC3401 session membership (state key is the user id)
+    # MSC3401 session membership
     content["application"] = content.get("application") or "m.call"
-    content["call_id"] = content.get("call_id") or "ROOM"
+    content.setdefault("call_id", "ROOM")
     content["device_id"] = device_id
-    if sfu_url:
-        content["foci_preferred"] = [{"type": "livekit", "url": sfu_url}]
-    elif service_url:
-        content["foci_preferred"] = [{"livekit_service_url": service_url}]
-    return user_id, content
+    if "membershipID" in content or str(template.get("state_key") or "").startswith("_"):
+        content["membershipID"] = member_id          # the identity we join with
+    if not content.get("foci_preferred"):
+        if sfu_url:
+            content["foci_preferred"] = [{"type": "livekit", "url": sfu_url}]
+        elif service_url:
+            content["foci_preferred"] = [{"livekit_service_url": service_url}]
+
+    key = str(template.get("state_key") or "")
+    if not key or key == sender:
+        key = user_id
+    else:
+        if sender:
+            key = key.replace(sender, user_id)
+        if their_device:
+            key = key.replace(their_device, device_id)
+    return key, content
 
 
 def left_membership(template: dict, *, user_id: str, device_id: str,
                     member_id: str) -> tuple[str, dict]:
-    """The withdrawal event that ends our participation."""
-    if is_sticky(template):
+    """The withdrawal event that ends our participation (same state key)."""
+    content = template.get("content") or {}
+    if is_sticky(content):
         return member_id, {"member": {
             "membership": "leave", "id": member_id,
             "slot_id": slot_id_of(template),
             "claimed_user_id": user_id, "claimed_device_id": device_id}}
-    return user_id, {}
+    key, _ = own_membership(template, user_id=user_id, device_id=device_id,
+                            member_id=member_id)
+    return key, {}
 
 
 def _rms(data: bytes) -> float:
@@ -134,15 +158,22 @@ class CallSession:
     """A single answered call in one room (runs its own asyncio loop)."""
 
     def __init__(self, manager: "CallManager", room_id: str, room_name: str | None,
-                 template: dict, template_type: str):
+                 template: dict):
+        """``template`` is the caller's *whole* membership event: we mirror it."""
         self.mgr = manager
         self.bot: Bot = manager.bot
         self.cfg: CallConfig = manager.cfg
         self.room_id = room_id
         self.room_name = room_name
         self.template = template
-        self.template_type = template_type
-        self.member_id = "mw-" + secrets.token_hex(8)
+        self.template_type = template.get("type") or "org.matrix.msc3401.call.member"
+        self.sticky = is_sticky(template.get("content") or {})
+        device_id = self.bot.client.device_id or ""
+        #: the identity we join the SFU with *and* publish as membershipID —
+        #: legacy Element Call expects "userId:deviceId" (what its own /sfu/get
+        #: token carries), MSC4143 clients expect a per-member id
+        self.member_id = ("mw-" + secrets.token_hex(8)) if self.sticky \
+            else f"{self.bot.user_id}:{device_id}"
         self.started = time.monotonic()
         self.stopping = threading.Event()
         self.utterances = 0
@@ -150,8 +181,10 @@ class CallSession:
         self._buf = bytearray()
         self._speech = 0.0
         self._silence = 0.0
+        self._loud = 0.0
         self._in_speech = False
-        self._echo_until = 0.0          # half duplex: ignore input while we speak
+        self._echo_until = 0.0          # half duplex: damp input while we speak
+        self._interrupted = False       # the caller cut us off
         self._source = None
         self._thread: threading.Thread | None = None
         self.tag = f"[call:{self.bot.name}:{room_id[:14]}]"
@@ -193,7 +226,8 @@ class CallSession:
         service_url = next((t.get("livekit_service_url") for t in transports
                             if t.get("livekit_service_url")), "")
         slot = slot_id_of(self.template)
-        token = self.bot.client.livekit_token(self.room_id, slot, self.member_id)
+        token = self.bot.client.livekit_token(
+            self.room_id, slot, self.member_id if self.sticky else None)
         sfu_url = token.get("url") or ""
         if not sfu_url or not token.get("jwt"):
             _log(f"{self.tag} the JWT service gave no usable token: {token}")
@@ -209,7 +243,8 @@ class CallSession:
             _log(f"{self.tag} publishing call membership failed: {exc} "
                  "(the bot needs power level >= 50 in this room)")
             return
-        _log(f"{self.tag} joined {self.template_type} slot {slot} via {sfu_url}")
+        _log(f"{self.tag} joined {self.template_type} slot {slot} as {self.member_id} "
+             f"(state key {key!r}) via {sfu_url}")
 
         room = rtc.Room()
         source = rtc.AudioSource(OUT_RATE, 1)
@@ -229,9 +264,8 @@ class CallSession:
             await room.local_participant.publish_track(track)
 
             tasks = [asyncio.create_task(self._pump_incoming(incoming)),
-                     asyncio.create_task(self._refresh_membership())]
-            if self.cfg.greeting:
-                tasks.append(asyncio.create_task(self._speak(self.cfg.greeting)))
+                     asyncio.create_task(self._refresh_membership()),
+                     asyncio.create_task(self._greet())]
             deadline = self.started + self.cfg.max_seconds
             while not self.stopping.is_set():
                 if time.monotonic() > deadline:
@@ -267,6 +301,17 @@ class CallSession:
             except Exception as exc:  # noqa: BLE001
                 _log(f"{self.tag} membership refresh failed: {exc}")
 
+    async def _greet(self) -> None:
+        """Say hello — unless the caller already started talking."""
+        import asyncio
+        if not self.cfg.greeting:
+            return
+        await asyncio.sleep(1.5)
+        if self.stopping.is_set() or self.utterances or self._in_speech or self._speech:
+            _log(f"{self.tag} greeting skipped (the caller already spoke)")
+            return
+        await self._speak(self.cfg.greeting)
+
     # -- listening ---------------------------------------------------------------
 
     async def _pump_incoming(self, incoming: asyncio.Queue) -> None:
@@ -293,16 +338,28 @@ class CallSession:
                 _log(f"{self.tag} audio stream from {who} ended: {exc!r}")
 
     def _feed(self, frame) -> None:
-        """Energy VAD: buffer speech, hand complete utterances to the agent."""
+        """Energy VAD: buffer speech, hand complete utterances to the agent.
+
+        While we speak ourselves the input is damped, not thrown away: our own
+        voice comes back through the caller's microphone, usually quieter than
+        the caller.  Anything clearly louder than that for ``barge_in`` seconds
+        is the caller interrupting us — we stop talking and start listening.
+        """
         import asyncio
 
-        if time.monotonic() < self._echo_until:
-            self._buf.clear()
-            self._in_speech, self._speech, self._silence = False, 0.0, 0.0
-            return
-
         dur = frame.samples_per_channel / OUT_RATE
-        if _rms(frame.data) >= self.cfg.vad_threshold:
+        gated = time.monotonic() < self._echo_until
+        threshold = self.cfg.vad_threshold * (self.cfg.echo_factor if gated else 1.0)
+
+        if _rms(frame.data) >= threshold:
+            if gated:
+                self._loud += dur
+                if self._loud < self.cfg.barge_in:
+                    return                    # still most likely our own echo
+                _log(f"{self.tag} caller interrupted us after "
+                     f"{self._speech:.1f}s of our speech")
+                self._echo_until = 0.0
+                self._interrupt()
             self._in_speech = True
             self._speech += dur
             self._silence = 0.0
@@ -312,6 +369,7 @@ class CallSession:
                 self._flush()
             return
 
+        self._loud = 0.0
         if not self._in_speech:
             return
         self._buf.extend(frame.data)            # keep the trailing word
@@ -319,13 +377,23 @@ class CallSession:
         if self._silence >= self.cfg.silence_end:
             self._flush()
 
+    def _interrupt(self) -> None:
+        """Stop our own playback (the caller is talking over us)."""
+        self._interrupted = True
+        if self._source is not None:
+            try:
+                self._source.clear_queue()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _flush(self) -> None:
         """Hand the buffered utterance to the answering pipeline."""
         import asyncio
 
         pcm, speech = bytes(self._buf), self._speech
         self._buf = bytearray()
-        self._in_speech, self._speech, self._silence = False, 0.0, 0.0
+        self._in_speech, self._speech = False, 0.0
+        self._silence = self._loud = 0.0
         if speech < self.cfg.min_speech or len(pcm) < OUT_RATE // 4:
             return
         _log(f"{self.tag} utterance {speech:.1f}s -> stt")
@@ -383,15 +451,20 @@ class CallSession:
         pcm = resample(pcm, rate, OUT_RATE)
         seconds = len(pcm) / 2 / OUT_RATE
         _log(f"{self.tag} speaking {seconds:.1f}s: {text[:100]}")
+        self._interrupted = False
         self._echo_until = time.monotonic() + seconds + 0.5
         size = int(OUT_RATE * FRAME_MS / 1000) * 2
         for i in range(0, len(pcm), size):
             if self.stopping.is_set():
                 return
+            if self._interrupted:
+                _log(f"{self.tag} stopped speaking after {i / 2 / OUT_RATE:.1f}s "
+                     "(the caller interrupted)")
+                return
             chunk = pcm[i:i + size]
             await self._source.capture_frame(
                 rtc.AudioFrame(chunk, OUT_RATE, 1, len(chunk) // 2))
-            while self._source.queued_duration > 1000:
+            while self._source.queued_duration > 1000 and not self._interrupted:
                 await asyncio.sleep(0.05)
 
     def _run_command(self, transcript: str) -> str:
@@ -478,14 +551,17 @@ class CallManager:
         content = ev.get("content") or {}
         left = not content or (is_sticky(content)
                                and content["member"].get("membership") == "leave")
+        # keyed by state key, not sender: that identifies one device's seat in
+        # the call, so a second device keeps the call alive
+        seat = ev.get("state_key") or sender or ""
         if left:
-            self._forget_membership(room_id, sender)
-            if not self._members.get(room_id):
+            self._members.setdefault(room_id, set()).discard(seat)
+            if not self._members[room_id]:
                 self.stop_room(room_id, "everyone left")
             return
 
-        self._members.setdefault(room_id, set()).add(sender)
-        self.join(room_id, ev.get("room_name"), content, ev["type"])
+        self._members.setdefault(room_id, set()).add(seat)
+        self.join(room_id, ev.get("room_name"), ev)
 
     def poll_rooms(self) -> None:
         """Find calls that are already running (e.g. after a restart)."""
@@ -511,12 +587,12 @@ class CallManager:
                                      "sender": ev.get("sender"),
                                      "content": ev.get("content") or {}})
 
-    def join(self, room_id: str, room_name: str | None, content: dict,
-             event_type: str) -> None:
+    def join(self, room_id: str, room_name: str | None, template: dict) -> None:
+        """Answer the call whose membership event is ``template``."""
         with self._lock:
             if room_id in self._sessions:
                 return
-            session = CallSession(self, room_id, room_name, content, event_type)
+            session = CallSession(self, room_id, room_name, template)
             self._sessions[room_id] = session
         if self.speech is None:
             self.on_log(f"[call:{self.bot.name}] VOICE_BASE_URL is not set — "
@@ -559,7 +635,3 @@ class CallManager:
         with self._lock:
             if self._sessions.get(session.room_id) is session:
                 self._sessions.pop(session.room_id, None)
-
-    def _forget_membership(self, room_id: str, sender: str | None) -> None:
-        if sender:
-            self._members.setdefault(room_id, set()).discard(sender)

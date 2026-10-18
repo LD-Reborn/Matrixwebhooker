@@ -83,6 +83,8 @@ class CallConfig:
     cue_after: float = 4.0                # seconds before that cue
     log_transcripts: bool = True          # post heard + answer into the room
     vad_threshold: int = 400        # rms of 16-bit pcm that counts as speech
+    echo_factor: float = 2.5        # while we speak, input must be this louder
+    barge_in: float = 0.4           # seconds of that before we stop talking
     silence_end: float = 0.9        # seconds of silence closing an utterance
     min_speech: float = 0.35        # shorter blips are dropped
     max_utterance: float = 20.0     # seconds before an utterance is cut off
@@ -121,6 +123,8 @@ def call_config_from(entry: dict, path: Path) -> CallConfig:
         max_seconds = int(raw.get("max_seconds", 900))
         vad = int(raw.get("vad_threshold", 400))
         silence_end = float(raw.get("silence_end", 0.9))
+        echo_factor = float(raw.get("echo_factor", 2.5))
+        barge_in = float(raw.get("barge_in", 0.4))
         min_speech = float(raw.get("min_speech", 0.35))
         max_utterance = float(raw.get("max_utterance", 20.0))
         cue_after = float(raw.get("cue_after", 4.0))
@@ -142,6 +146,8 @@ def call_config_from(entry: dict, path: Path) -> CallConfig:
         cue_after=cue_after,
         log_transcripts=bool(raw.get("log_transcripts", True)),
         vad_threshold=vad,
+        echo_factor=echo_factor,
+        barge_in=barge_in,
         silence_end=silence_end,
         min_speech=min_speech,
         max_utterance=max_utterance,
@@ -646,11 +652,17 @@ class Matrix:
                     f"{quote(self.user_id, safe='')}/openid/request_token",
             {"access_token": self.token})
 
-    def livekit_token(self, room_id: str, slot_id: str, member_id: str) -> dict:
+    def livekit_token(self, room_id: str, slot_id: str = "m.call#ROOM",
+                      member_id: str | None = None) -> dict:
         """-> ``{"url": "wss://…/sfu", "jwt": "…"}`` for one call slot.
 
-        Uses the JWT service advertised by the homeserver (MSC4195
-        ``/get_token``; the older ``/sfu/get`` is tried as a fallback).
+        With a ``member_id`` we ask the JWT service the MSC4195 way
+        (``/get_token``), so the LiveKit identity is that member id.  Without
+        one we use the older ``/sfu/get``, whose identity is
+        ``userId:deviceId`` — the form current Element Call clients publish as
+        ``membershipID`` and use to match LiveKit participants to call
+        memberships.  Join with the wrong identity and the other side never
+        hears us: their client has no membership to attach our audio to.
         """
         transports = self.rtc_transports()
         service = next((t.get("livekit_service_url") for t in transports
@@ -665,17 +677,20 @@ class Matrix:
                 "POST", f"{self.hs}/_matrix/client/unstable/io.element.msc4195"
                         f"/rtc/livekit/get_token",
                 {"url": sfu, "room_id": room_id, "slot_id": slot_id,
-                 "member_id": member_id})
+                 "member_id": member_id or f"{self.user_id}:{self.device_id}"})
             return {"url": sfu, "jwt": data.get("jwt", "")}
-        body = {
-            "room_id": room_id,
-            "slot_id": slot_id,
-            "openid_token": self.openid_token(),
-            "member": {"id": member_id, "claimed_user_id": self.user_id,
-                       "claimed_device_id": self.device_id or ""},
-        }
+        oid = self.openid_token()
+        if member_id is None:
+            body = {"room": room_id, "openid_token": oid,
+                    "device_id": self.device_id or ""}
+            paths = ("/sfu/get", "/get_token")
+        else:
+            body = {"room_id": room_id, "slot_id": slot_id, "openid_token": oid,
+                    "member": {"id": member_id, "claimed_user_id": self.user_id,
+                               "claimed_device_id": self.device_id or ""}}
+            paths = ("/get_token", "/sfu/get")
         last: MatrixError | None = None
-        for path in ("/get_token", "/sfu/get"):
+        for path in paths:
             try:
                 data = self._request("POST", service.rstrip("/") + path, body)
             except MatrixError as exc:

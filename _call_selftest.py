@@ -35,13 +35,25 @@ from speech import Speech, SpeechConfig, resample         # noqa: E402
 
 ROOM_NAME = "MatrixWebhooker call selftest"
 
-#: the membership shape we hand the manager as "what the caller sent"
-TEMPLATE_TYPE = "org.matrix.msc3401.call.member"
-TEMPLATE_CONTENT = {
-    "application": "m.call",
-    "call_id": "ROOM",
-    "device_id": "SELFTEST",
-    "m.call.intent": "m.call.voice",
+#: the membership we hand the manager as "what the caller sent" — shaped like
+#: current Element Call (state key `_<user>_<device>_<application>`, empty
+#: call id, membershipID = the LiveKit identity)
+TEMPLATE_EVENT = {
+    "type": "org.matrix.msc3401.call.member",
+    "state_key": "_@selftest:matrix.example.com_SELFCALL_m.call",
+    "sender": "@selftest:matrix.example.com",
+    "content": {
+        "application": "m.call",
+        "call_id": "",
+        "device_id": "SELFCALL",
+        "expires": 14400000,
+        "foci_preferred": [{"type": "livekit",
+                            "livekit_service_url": "https://matrix.example.com/livekit/jwt"}],
+        "focus_active": {"focus_selection": "multi_sfu", "type": "livekit"},
+        "m.call.intent": "audio",
+        "membershipID": "@selftest:matrix.example.com:SELFCALL",
+        "scope": "m.room",
+    },
 }
 
 
@@ -55,7 +67,7 @@ async def run_caller(bot: Bot, room_id: str, question: str, seconds: float,
     pcm = resample(pcm, rate, OUT_RATE)
     print(f"caller: asking {len(pcm) / 2 / OUT_RATE:.1f}s of audio")
 
-    token = bot.client.livekit_token(room_id, "m.call#ROOM", "selftest-peer")
+    token = bot.client.livekit_token(room_id, "m.call#")      # legacy /sfu/get
     room = rtc.Room()
     source = rtc.AudioSource(OUT_RATE, 1)
     track = rtc.LocalAudioTrack.create_audio_track("caller", source)
@@ -124,7 +136,7 @@ def main() -> int:
     if mgr.speech is None:
         print("VOICE_BASE_URL is not set", file=sys.stderr)
         return 2
-    mgr.join(room_id, ROOM_NAME, TEMPLATE_CONTENT, TEMPLATE_TYPE)
+    mgr.join(room_id, ROOM_NAME, TEMPLATE_EVENT)
     time.sleep(3)                       # let the bot publish + connect
 
     try:
