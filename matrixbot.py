@@ -494,14 +494,17 @@ class Matrix:
         and, for plaintext ones, ``msgtype``/``body``; encrypted ones carry
         ``raw`` (Megolm material) for decryption by ``Bot.crypto``. ``state``
         holds *changed* room state of interest (room name plus the MatrixRTC
-        call-membership events, see CALL_STATE_TYPES). ``to_device`` holds the
+        call-membership events, see CALL_STATE_TYPES — those are picked out of
+        the timeline, because /sync only sends state deltas when the timeline
+        is limited). ``to_device`` holds the
         raw to-device events (Olm/Megolm key material). A call without
         ``since`` is a snapshot: its events are historical and the caller
         must not act on them.
         """
         flt = json.dumps(
             {"room": {
-                "timeline": {"types": ["m.room.message", "m.room.encrypted"], "limit": 100},
+                "timeline": {"types": ["m.room.message", "m.room.encrypted",
+                                       *CALL_STATE_TYPES], "limit": 100},
                 "state": {"types": ["m.room.name", "m.room.canonical_alias",
                                     *CALL_STATE_TYPES]},
             },
@@ -529,8 +532,17 @@ class Matrix:
                         name = (se.get("content") or {}).get("name") \
                             or (se.get("content") or {}).get("body")
                         break
+            seen_state: set[tuple] = set()
             for ev in (rdata.get("timeline", {}) or {}).get("events", []) or []:
                 etype = ev.get("type")
+                if etype in CALL_STATE_TYPES:
+                    # State events also arrive in the timeline, and that is the
+                    # only reliable place to see them: /sync sends state deltas
+                    # only when the timeline comes back "limited".
+                    entry = self._state_entry(room_id, name, ev)
+                    seen_state.add((entry["type"], entry["state_key"], entry["event_id"]))
+                    state.append(entry)
+                    continue
                 if etype not in ("m.room.message", "m.room.encrypted"):
                     continue
                 content = ev.get("content", {})
@@ -561,20 +573,28 @@ class Matrix:
             for se in ((rdata.get("state", {}) or {}).get("events", [])) or []:
                 if se.get("type") not in CALL_STATE_TYPES:
                     continue
-                state.append({
-                    "room_id": room_id,
-                    "room_name": name,
-                    "type": se.get("type"),
-                    "state_key": se.get("state_key"),
-                    "sender": se.get("sender"),
-                    "ts": se.get("origin_server_ts"),
-                    "content": se.get("content") or {},
-                })
+                entry = self._state_entry(room_id, name, se)
+                if (entry["type"], entry["state_key"], entry["event_id"]) in seen_state:
+                    continue
+                state.append(entry)
         return {
             "next_batch": data.get("next_batch"),
             "events": events,
             "state": state,
             "to_device": (data.get("to_device", {}) or {}).get("events", []),
+        }
+
+    @staticmethod
+    def _state_entry(room_id: str, name: str | None, ev: dict) -> dict:
+        return {
+            "room_id": room_id,
+            "room_name": name,
+            "type": ev.get("type"),
+            "state_key": ev.get("state_key"),
+            "event_id": ev.get("event_id"),
+            "sender": ev.get("sender"),
+            "ts": ev.get("origin_server_ts"),
+            "content": ev.get("content") or {},
         }
 
     # -- room state (MatrixRTC calls) ------------------------------------------
