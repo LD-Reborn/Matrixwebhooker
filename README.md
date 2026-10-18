@@ -273,8 +273,15 @@ How it behaves:
   `echo_factor` (default 2.5) times louder than `vad_threshold` to count —
   that is its own voice coming back through your microphone. Speak clearly
   over it for `barge_in` seconds (default 0.4) and the bot stops talking and
-  listens. The greeting is skipped when you started speaking first. While the bot speaks it
-  ignores incoming audio (half duplex, no self-answering).
+  listens. 0.8 s of audio before every utterance is kept, so an interruption
+  that begins mid-greeting does not lose its first words. The greeting is
+  skipped when you started speaking first.
+- Voice: `VOICE_TTS_INSTRUCTION` (default `Professionell, deutsch.`) goes to
+  qwen3-tts as `instructions`, `VOICE_LANGUAGE` as an ISO `language` code.
+  The greeting and the thinking cue are synthesized once and cached
+  (`VOICE_CACHE_DIR`, default `<state dir>/voice-cache`): synthesizing them at
+  join time costs ~9 s, long enough for the caller to have asked their
+  question already — which is exactly what it used to sound like.
   Like the trigger commands, this is a **bash command line**: the placeholders
   are substituted shell-quoted, but the rest of the text is not — so quote your
   prompt or leave out `(`, `)`, `;`, `|`, `&`, `$` (an unquoted parenthesis is

@@ -25,9 +25,17 @@
         "enabled": true,
         "command": "opencode run --standalone -m ollama/qwen3.8:27b-mtp-q4_K_M-128k \"Answer this spoken question out loud in one or two short sentences (your stdout is read aloud by TTS): {{transcript}}\"",
         "greeting": "Hallo, ich bin der Bot.",
-        "rooms": ["Grafana Bot Alerts"],
+        "thinking_cue": "Einen Moment.",
+        "cue_after": 2.0,
+        "rooms": [
+          "Grafana Bot Alerts"
+        ],
         "max_seconds": 600,
-        "language": "de"
+        "language": "de",
+        "vad_threshold": 400,
+        "echo_factor": 2.5,
+        "barge_in": 0.4,
+        "silence_end": 0.9
       }
     }
   ]
