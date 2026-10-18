@@ -80,7 +80,7 @@ class CallConfig:
     greeting: str = ""
     language: str = ""
     thinking_cue: str = "Einen Moment."   # spoken while the command is still running
-    cue_after: float = 4.0                # seconds before that cue
+    cue_after: float = 2.0                # seconds before that cue
     log_transcripts: bool = True          # post heard + answer into the room
     vad_threshold: int = 400        # rms of 16-bit pcm that counts as speech
     echo_factor: float = 2.5        # while we speak, input must be this louder
@@ -127,7 +127,7 @@ def call_config_from(entry: dict, path: Path) -> CallConfig:
         barge_in = float(raw.get("barge_in", 0.4))
         min_speech = float(raw.get("min_speech", 0.35))
         max_utterance = float(raw.get("max_utterance", 20.0))
-        cue_after = float(raw.get("cue_after", 4.0))
+        cue_after = float(raw.get("cue_after", 2.0))
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"{path}: 'call': numeric setting is not a number: {exc}") from exc
     if not 1 <= context <= 100:

@@ -442,6 +442,7 @@ class MessageWatcher:
         self._load_key_pending()
         calls = getattr(self.bot, "calls", None)
         if calls is not None:
+            calls.prewarm()      # greeting + cue, so a call starts talking at once
             # a call may already be running (we restarted mid-call)
             threading.Thread(target=calls.poll_rooms,
                              name=f"callpoll-{self.bot.name}", daemon=True).start()

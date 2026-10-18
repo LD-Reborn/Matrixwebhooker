@@ -10,6 +10,10 @@ One quirk of the reverse proxy in front of it: it picks the backend from the
 model name found in the *JSON body or query string*, and a multipart upload
 hides it — so the model is always repeated in the query string.
 
+TTS takes natural-language style control (``VOICE_TTS_INSTRUCTION``, default
+"Professionell, deutsch.") plus an ISO ``language`` code; fixed phrases are
+cached on disk (``VOICE_CACHE_DIR``) so a call starts talking immediately.
+
 Everything in and out of this module is 16-bit signed mono PCM plus a sample
 rate; the wav container is only used on the wire.
 """
@@ -17,6 +21,7 @@ rate; the wav container is only used on the wire.
 from __future__ import annotations
 
 import array
+import hashlib
 import math
 import os
 import struct
@@ -24,6 +29,7 @@ import sys
 import wave
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 
 
 class SpeechError(RuntimeError):
@@ -36,6 +42,7 @@ class SpeechConfig:
     stt_model: str = "whisper-large-v3-turbo"
     tts_model: str = "qwen3-tts-customvoice"
     tts_voice: str = ""                 # empty -> the gateway's default voice
+    tts_instruction: str = "Professionell, deutsch."   # qwen3-tts style control
     language: str = ""                  # e.g. "de"; empty -> whisper auto-detect
 
     @classmethod
@@ -48,6 +55,8 @@ class SpeechConfig:
             stt_model=os.environ.get("VOICE_STT_MODEL", cls.stt_model).strip(),
             tts_model=os.environ.get("VOICE_TTS_MODEL", cls.tts_model).strip(),
             tts_voice=os.environ.get("VOICE_TTS_VOICE", "").strip(),
+            tts_instruction=os.environ.get(
+                "VOICE_TTS_INSTRUCTION", cls.tts_instruction).strip(),
             language=os.environ.get("VOICE_LANGUAGE", "").strip(),
         )
 
@@ -118,10 +127,13 @@ def tone(seconds: float, freq: float = 440.0, rate: int = 48000, amp: int = 6000
 
 
 class Speech:
-    def __init__(self, cfg: SpeechConfig, on_log=None, timeout: float = 30.0):
+    def __init__(self, cfg: SpeechConfig, on_log=None, timeout: float = 30.0,
+                 cache_dir=None):
         self.cfg = cfg
         self.timeout = timeout
         self.on_log = on_log or (lambda msg: print(f"[speech] {msg}", file=sys.stderr))
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        self._cache: dict[str, bytes] = {}
 
     def _url(self, path: str, params: dict[str, str] | None = None) -> str:
         url = f"{self.cfg.base_url}/v1/{path}"
@@ -153,8 +165,16 @@ class Speech:
         except ValueError as exc:
             raise SpeechError(f"stt answer is not json: {resp.text[:200]}") from exc
 
-    def synthesize(self, text: str, voice: str | None = None) -> tuple[bytes, int]:
-        """qwen3-tts: text -> (16-bit mono pcm, sample rate)."""
+    def synthesize(self, text: str, voice: str | None = None,
+                   language: str | None = None) -> tuple[bytes, int]:
+        """qwen3-tts: text -> (16-bit mono pcm, sample rate).
+
+        ``instructions`` is how qwen3-tts takes natural-language style control
+        ("Professionell, deutsch."); ``language`` is an ISO code and keeps the
+        voice from drifting into an accent.  Both are forwarded by the gateway
+        (verified: a bogus ``language`` comes back as 400, so the body does
+        reach the model).
+        """
         import requests
 
         payload = {"model": self.cfg.tts_model, "input": text,
@@ -162,11 +182,60 @@ class Speech:
         v = voice if voice is not None else self.cfg.tts_voice
         if v:
             payload["voice"] = v
+        if self.cfg.tts_instruction:
+            payload["instructions"] = self.cfg.tts_instruction
+        lang = language if language is not None else self.cfg.language
+        if lang:
+            payload["language"] = lang
         try:
             resp = requests.post(self._url("audio/speech"), json=payload,
                                  timeout=self.timeout)
         except requests.RequestException as exc:
             raise SpeechError(f"tts request failed: {exc}") from exc
+        if resp.status_code >= 400 and "language" in payload:
+            # a code the tts backend does not know: speak anyway, uncontrolled
+            payload.pop("language")
+            try:
+                resp = requests.post(self._url("audio/speech"), json=payload,
+                                     timeout=self.timeout)
+            except requests.RequestException as exc:
+                raise SpeechError(f"tts request failed: {exc}") from exc
         if resp.status_code >= 400:
             raise SpeechError(f"tts http {resp.status_code}: {resp.text[:200]}")
         return wav_to_pcm(resp.content)
+
+    def cached(self, text: str, rate: int = 48000,
+               language: str | None = None) -> bytes:
+        """Synthesize a fixed phrase once, then read it from disk.
+
+        The greeting and the "one moment" cue must not wait for the network:
+        a four-second synthesis is exactly what makes the bot greet its caller
+        *after* the caller has already asked their question.
+        """
+        key = hashlib.sha1("|".join((
+            self.cfg.tts_model, self.cfg.tts_voice, self.cfg.tts_instruction,
+            (language if language is not None else self.cfg.language), text,
+        )).encode()).hexdigest()
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        path = self.cache_dir / f"{key}.raw" if self.cache_dir else None
+        if path is not None and path.exists():
+            try:
+                data = path.read_bytes()
+                self._cache[key] = data
+                return data
+            except OSError:
+                pass
+        pcm, src_rate = self.synthesize(text, language=language)
+        pcm = resample(pcm, src_rate, rate)
+        self._cache[key] = pcm
+        if path is not None:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_bytes(pcm)
+                tmp.replace(path)
+            except OSError as exc:
+                self.on_log(f"voice cache not writable: {exc}")
+        return pcm

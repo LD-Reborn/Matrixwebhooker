@@ -311,15 +311,21 @@ class CallSession:
                 _log(f"{self.tag} membership refresh failed: {exc}")
 
     async def _greet(self) -> None:
-        """Say hello — unless the caller already started talking."""
+        """Say hello right away — the caller can simply talk over us.
+
+        This used to wait 1.5 s and then synthesize, which took a few more
+        seconds: callers had already asked their question and then heard the
+        greeting *after* it.  The audio is cached, so it starts at once and
+        barge-in cuts it off.
+        """
         import asyncio
         if not self.cfg.greeting:
             return
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(0.3)
         if self.stopping.is_set() or self.utterances or self._in_speech or self._speech:
             _log(f"{self.tag} greeting skipped (the caller already spoke)")
             return
-        await self._speak(self.cfg.greeting)
+        await self._speak(self.cfg.greeting, cached=True)
 
     # -- listening ---------------------------------------------------------------
 
@@ -429,7 +435,7 @@ class CallSession:
         if self.cfg.thinking_cue:
             done, _ = await asyncio.wait({fut}, timeout=self.cfg.cue_after)
             if not done and not self.stopping.is_set():
-                await self._speak(self.cfg.thinking_cue)
+                await self._speak(self.cfg.thinking_cue, cached=True)
         answer = await fut
         if answer:
             await self._speak(answer)
@@ -444,7 +450,7 @@ class CallSession:
         except MatrixError as exc:
             _log(f"{self.tag} writing the call record to the room failed: {exc}")
 
-    async def _speak(self, text: str) -> None:
+    async def _speak(self, text: str, cached: bool = False) -> None:
         import asyncio
 
         from livekit import rtc
@@ -453,11 +459,17 @@ class CallSession:
             return
         loop = asyncio.get_running_loop()
         try:
-            pcm, rate = await loop.run_in_executor(None, self.mgr.speech.synthesize, text)
+            if cached:
+                pcm = await loop.run_in_executor(
+                    None, lambda: self.mgr.speech.cached(text, OUT_RATE,
+                                                         self.cfg.language))
+            else:
+                pcm, rate = await loop.run_in_executor(
+                    None, self.mgr.speech.synthesize, text)
+                pcm = resample(pcm, rate, OUT_RATE)
         except SpeechError as exc:
             _log(f"{self.tag} {exc}")
             return
-        pcm = resample(pcm, rate, OUT_RATE)
         seconds = len(pcm) / 2 / OUT_RATE
         _log(f"{self.tag} speaking {seconds:.1f}s: {text[:100]}")
         self._interrupted = False
@@ -534,10 +546,39 @@ class CallManager:
         self.cfg = cfg
         self.on_log = on_log or _log
         speech_cfg = SpeechConfig.from_env()
-        self.speech = Speech(speech_cfg, on_log=on_log) if speech_cfg else None
+        if speech_cfg:
+            cache = os.environ.get("VOICE_CACHE_DIR", "").strip()
+            self.speech = Speech(speech_cfg, on_log=on_log,
+                                 cache_dir=cache or Path(bot.client.state_dir)
+                                                     / "voice-cache")
+        else:
+            self.speech = None
         self._sessions: dict[str, CallSession] = {}
         self._members: dict[str, set[str]] = {}
         self._lock = threading.Lock()
+
+    def prewarm(self) -> None:
+        """Synthesize the fixed phrases once, in the background.
+
+        The greeting and the "one moment" cue are the two things that have to
+        be ready *before* the caller says anything; paying for them at join
+        time costs seconds of dead air and puts the greeting after the
+        question it is answering.
+        """
+        if self.speech is None:
+            return
+        phrases = [p for p in (self.cfg.greeting, self.cfg.thinking_cue) if p]
+
+        def _warm() -> None:
+            for phrase in phrases:
+                try:
+                    self.speech.cached(phrase, OUT_RATE, self.cfg.language)
+                except SpeechError as exc:
+                    self.on_log(f"[call:{self.bot.name}] prewarm failed: {exc}")
+
+        if phrases:
+            threading.Thread(target=_warm, daemon=True,
+                             name=f"call-prewarm-{self.bot.name}").start()
 
     # -- entry points ------------------------------------------------------------
 
