@@ -185,6 +185,7 @@ class CallSession:
         self._in_speech = False
         self._echo_until = 0.0          # half duplex: damp input while we speak
         self._interrupted = False       # the caller cut us off
+        self._skip_leave = False        # replaced by a newer session
         self._source = None
         self._thread: threading.Thread | None = None
         self.tag = f"[call:{self.bot.name}:{room_id[:14]}]"
@@ -200,6 +201,12 @@ class CallSession:
         if not self.stopping.is_set():
             _log(f"{self.tag} ending call: {reason}")
         self.stopping.set()
+
+    def abandon(self) -> None:
+        """Stop without withdrawing our membership: a new session for the same
+        room has already published it, and our leave would undo that."""
+        self._skip_leave = True
+        self.stop("replaced by a new call")
 
     def _guard(self) -> None:
         import asyncio
@@ -275,13 +282,15 @@ class CallSession:
             for t in tasks:
                 t.cancel()
         finally:
-            try:
-                key, leave = left_membership(
-                    self.template, user_id=self.bot.user_id,
-                    device_id=self.bot.client.device_id or "", member_id=self.member_id)
-                self.bot.client.send_state(self.room_id, self.template_type, key, leave)
-            except MatrixError as exc:
-                _log(f"{self.tag} withdrawing membership failed: {exc}")
+            if not self._skip_leave:
+                try:
+                    key, leave = left_membership(
+                        self.template, user_id=self.bot.user_id,
+                        device_id=self.bot.client.device_id or "",
+                        member_id=self.member_id)
+                    self.bot.client.send_state(self.room_id, self.template_type, key, leave)
+                except MatrixError as exc:
+                    _log(f"{self.tag} withdrawing membership failed: {exc}")
             try:
                 await room.disconnect()
             except Exception:  # noqa: BLE001
@@ -590,8 +599,14 @@ class CallManager:
     def join(self, room_id: str, room_name: str | None, template: dict) -> None:
         """Answer the call whose membership event is ``template``."""
         with self._lock:
-            if room_id in self._sessions:
-                return
+            current = self._sessions.get(room_id)
+            if current is not None:
+                if not current.stopping.is_set():
+                    return
+                # the call was re-opened while we were still hanging up the old
+                # one (leave + join land in the same sync batch): replace it
+                self._sessions.pop(room_id, None)
+                current.abandon()
             session = CallSession(self, room_id, room_name, template)
             self._sessions[room_id] = session
         if self.speech is None:
