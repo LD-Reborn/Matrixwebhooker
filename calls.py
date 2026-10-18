@@ -400,8 +400,7 @@ class CallSession:
                 self._loud += dur
                 if self._loud < self.cfg.barge_in:
                     return                    # still most likely our own echo
-                _log(f"{self.tag} caller interrupted us after "
-                     f"{self._speech:.1f}s of our speech")
+                _log(f"{self.tag} caller interrupted us")
                 self._echo_until = 0.0
                 self._interrupt()
             self._in_speech = True
