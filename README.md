@@ -261,6 +261,10 @@ How it behaves:
   plus **`{{transcript}}`**, and its **stdout is what gets spoken** — keep
   answers short, TTS costs roughly 3× the audio length. While the bot speaks it
   ignores incoming audio (half duplex, no self-answering).
+  Like the trigger commands, this is a **bash command line**: the placeholders
+  are substituted shell-quoted, but the rest of the text is not — so quote your
+  prompt or leave out `(`, `)`, `;`, `|`, `&`, `$` (an unquoted parenthesis is
+  a bash syntax error and the answer silently stays empty).
 - A bare `stop` in the room hangs the call up; so does the last other
   participant leaving, the MatrixRTC slot closing, or `max_seconds`.
 - `GET /health` lists the active calls per bot.
