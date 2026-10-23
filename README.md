@@ -495,3 +495,7 @@ Desktop & friends):
 - A bot that runs from more than one place (container + MCP server) caches a
   separate token/login per place — that's one Matrix device each, both stay
   valid in parallel.
+
+## License
+
+GPL-3.0-only — see [LICENSE](LICENSE).
