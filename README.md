@@ -234,12 +234,12 @@ at the server (default `http://localhost:8080`).
 While the bot is **handling** a message it reacts to it with the wrench
 emoji, and removes the reaction again as soon as that handling is done:
 
-- a message that **fires a trigger** gets 🔧 as soon as the command starts;
+- a message that **fires a trigger** gets 🔧 as soon as the action starts;
 - a message **delivered to a model that is waiting** (`wait_for_reply`) also
   gets 🔧 while the run it belongs to is still in flight.
 
 The wrench is removed (the reaction event is redacted) when the trigger
-command(s) finish, the run is stopped, or the room's pending wait is
+action(s) finish, the run is stopped, or the room's pending wait is
 released — so in the room you can always tell which messages the bot is
 still working on.
 
@@ -298,7 +298,7 @@ A bot can answer the calls your Matrix client places in a room: it joins the
 call, listens, and answers out loud.
 
 ```
-you ──WebRTC──▶ LiveKit SFU ──▶ bot: whisper (STT) ──▶ your command ──▶ TTS ──▶ you
+you ──WebRTC──▶ LiveKit SFU ──▶ bot: whisper (STT) ──▶ OpenCode action ──▶ TTS ──▶ you
 ```
 
 Per bot in `bots.json` (needs `requirements-call.txt` installed and the
@@ -368,7 +368,7 @@ How it behaves:
   speaks**, does not stream (the first byte arrives once the clip is finished)
   and serializes — two concurrent requests take exactly as long as two in a
   row.  So the length of the answer *is* the latency: `max_answer_chars`
-  (default 220) clips it and the command prompt should ask for one short
+  (default 220) clips it and the action's prompt should ask for one short
   sentence.  Every stage logs its own timing:
 
   ```
