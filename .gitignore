@@ -3,12 +3,23 @@ bots.json
 local_secrets.json
 .token
 .room_id
-bot/
+# per-bot state dirs (named after the bot): token cache, room id, crypto pickles
+*/.token
+*/.room_id
+*/crypto/
 .trigger-context/
 __pycache__/
 *.pyc
 .venv/
 venv/
-example_bot/
 .selftest_room
 selftest-answer.wav
+opencode.json
+# local-only maintenance/test scripts (tied to one real deployment)
+_bulk_delete.py
+_delete_device.py
+_fix_power_levels.py
+_live_e2e_test.py
+_refresh_otks.py
+_reregister.py
+recovery_bot.py

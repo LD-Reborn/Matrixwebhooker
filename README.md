@@ -182,8 +182,9 @@ triggers reference (and can override field by field):
     server's default model
   - `agent` — OpenCode agent id (empty = the default agent)
   - `directory` — where the session runs; default is the **app directory**,
-    so the project's `opencode.json` applies — including the matrix MCP
-    tools (`send_message`, `wait_for_reply`, `read_messages`, …)
+    so the project's `opencode.json` applies (copy `opencode.example.json`
+    and adjust the paths) — including the matrix MCP tools (`send_message`,
+    `wait_for_reply`, `read_messages`, …)
   - `timeout` — seconds to wait for the answer (default 300)
   - `keep_session` — keep the session after a *successful* run too
     (default false)
