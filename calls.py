@@ -1,6 +1,6 @@
 """Answering MatrixRTC (Element Call) calls with speech.
 
-A bot with ``"call": {"enabled": true, "command": "…"}`` in ``bots.json``
+A bot with ``"call": {"enabled": true, "action": {…}}`` in ``bots.json``
 joins a call that someone else started in a room it is in:
 
   1. the watcher hands us the room's changed call-membership state events
@@ -10,8 +10,8 @@ joins a call that someone else started in a room it is in:
      there), and ask the homeserver's JWT service for a LiveKit token;
   3. we join the LiveKit SFU, listen to the other participants, cut their
      speech into utterances (energy VAD), send each utterance to whisper,
-     run the configured command with the transcript and speak the answer
-     back through the TTS gateway;
+     run the configured action on the OpenCode server with the transcript
+     and speak the answer back through the TTS gateway;
   4. when the last other membership disappears (or the slot closes, or a bare
      ``stop`` arrives, or ``max_seconds`` elapse) we withdraw our membership
      and leave.
@@ -26,9 +26,6 @@ import array
 import json
 import os
 import secrets
-import shutil
-import signal
-import subprocess
 import sys
 import threading
 import time
@@ -36,7 +33,7 @@ from pathlib import Path
 
 from matrixbot import (BASE_DIR, CALL_STATE_TYPES, Bot, CallConfig, MatrixError)
 from speech import Speech, SpeechConfig, SpeechError, resample
-from triggers import _shell_prefix, format_history, render, write_context_files
+from triggers import format_history, render_text
 
 #: sample rate we publish at (LiveKit's native Opus rate)
 OUT_RATE = 48000
@@ -209,7 +206,7 @@ class CallSession:
         self._echo_until = 0.0          # half duplex: damp input while we speak
         self._interrupted = False       # the caller cut us off
         self._skip_leave = False        # replaced by a newer session
-        self._timed_out = False         # the answer command was killed
+        self._timed_out = False         # the answer action ran past its timeout
         self._source = None
         self._thread: threading.Thread | None = None
         self.tag = f"[call:{self.bot.name}:{room_id[:14]}]"
@@ -450,7 +447,7 @@ class CallSession:
     # -- answering ----------------------------------------------------------------
 
     async def _answer(self, pcm: bytes) -> None:
-        """stt -> command -> tts -> publish, one utterance at a time."""
+        """stt -> action -> tts -> publish, one utterance at a time."""
         import asyncio
 
         loop = asyncio.get_running_loop()
@@ -465,7 +462,7 @@ class CallSession:
             return
         _log(f"{self.tag} heard: {text[:120]}")
         self.utterances += 1
-        fut = loop.run_in_executor(None, self._run_command, text)
+        fut = loop.run_in_executor(None, self._run_action, text)
         if self.cfg.thinking_cue:
             done, _ = await asyncio.wait({fut}, timeout=self.cfg.cue_after)
             if not done and not self.stopping.is_set():
@@ -543,9 +540,11 @@ class CallSession:
             while self._source.queued_duration > 1000 and not self._interrupted:
                 await asyncio.sleep(0.05)
 
-    def _run_command(self, transcript: str) -> str:
-        """Run the configured command(s); the last one's stdout is the answer."""
-        if not self.cfg.commands:
+    def _run_action(self, transcript: str) -> str:
+        """Run the configured action; its final assistant text is the answer."""
+        action = self.cfg.action
+        if action is None:
+            _log(f"{self.tag} call enabled but 'call.action' is not configured")
             return ""
         try:
             history = self.bot.client.read_messages(self.room_id, limit=self.cfg.context,
@@ -561,45 +560,23 @@ class CallSession:
             "msg": format_history([*history, new_message]),
             "transcript": transcript,
         }
-        values["message_file"], values["history_file"] = write_context_files(
-            self.room_id, self.room_name, new_message, [*history, new_message])
-        env = dict(os.environ,
-                   MATRIX_BOT=self.bot.name, MATRIX_ROOM=self.room_id,
-                   MATRIX_CHANNEL=self.room_name or self.room_id,
-                   MATRIX_CALL="1", MCP_BOT=self.bot.name)
-        out = ""
         self._timed_out = False
-        try:
-            for command in self.cfg.commands:
-                cmdline = render(command, values)
-                _log(f"{self.tag} run: {cmdline[:200]}")
-                proc = subprocess.Popen(_shell_prefix() + [cmdline], env=env,
-                                        cwd=str(BASE_DIR), stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, text=True,
-                                        start_new_session=True)
-                try:
-                    stdout, stderr = proc.communicate(
-                        timeout=self.cfg.max_command_seconds)
-                except subprocess.TimeoutExpired:
-                    # start_new_session=True, so the whole process tree goes
-                    try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        proc.kill()
-                    stdout, stderr = proc.communicate()
-                    self._timed_out = True
-                    _log(f"{self.tag} no answer after "
-                         f"{self.cfg.max_command_seconds}s: killed the command")
-                    break
-                if proc.returncode != 0:
-                    _log(f"{self.tag} exit {proc.returncode}: "
-                         f"{str(stderr or stdout)[-300:]}")
-                out = (stdout or "").strip()
-        except Exception as exc:  # noqa: BLE001
-            _log(f"{self.tag} command failed: {exc!r}")
-        finally:
-            shutil.rmtree(str(Path(values["message_file"]).parent), ignore_errors=True)
-        return out
+        result = self.bot.opencode.run(
+            title=f"MatrixWebhooker call {self.bot.name} {self.room_name or self.room_id}",
+            prompt=render_text(action.prompt, values),
+            system=action.system, model=action.model, agent=action.agent,
+            directory=action.directory or str(BASE_DIR),
+            timeout=action.timeout, cancel=lambda: self.stopping.is_set(),
+            keep_session=action.keep_session,
+            log=lambda m: _log(f"{self.tag} {m}"))
+        if result.outcome == "timeout":
+            self._timed_out = True
+        elif result.outcome == "succeeded":
+            return result.text
+        elif result.outcome != "interrupted":
+            _log(f"{self.tag} action failed: {result.error} "
+                 f"(session {result.session_id} kept)")
+        return ""
 
 
 # ---------------------------------------------------------------------------

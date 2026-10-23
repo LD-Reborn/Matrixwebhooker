@@ -5,13 +5,13 @@ creates itself (so your real DMs stay untouched):
 
   * the *bot* side is the production code: ``CallManager.join`` publishes our
     MatrixRTC membership, asks the homeserver's JWT service for a LiveKit
-    token, joins the SFU, listens, runs the command and speaks the answer;
+    token, joins the SFU, listens, runs the action and speaks the answer;
   * the *caller* side is this script: it joins the same LiveKit room, speaks
     one question (TTS), records what comes back and transcribes it.
 
     python3 _call_selftest.py                       # canned question + canned answer
     python3 _call_selftest.py --question "Wer bist du?" \
-        --command 'echo "Ich bin der Testbot."'
+        --prompt "Antworte in einem kurzen Satz: {{transcript}}" --model ollama/bonsai-2:2b
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ BASE = Path(__file__).resolve().parent
 load_dotenv(BASE / ".env")
 
 from calls import OUT_RATE, CallConfig, CallManager      # noqa: E402
-from matrixbot import Bot, load_settings                  # noqa: E402
+from matrixbot import Action, Bot, load_settings          # noqa: E402
 from speech import Speech, SpeechConfig, resample         # noqa: E402
 
 ROOM_NAME = "MatrixWebhooker call selftest"
@@ -107,7 +107,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bot", default=os.environ.get("MCP_BOT", "example_bot"))
     ap.add_argument("--question", default="Was ist deine Testantwort?")
-    ap.add_argument("--command", default='echo "Testantwort: es funktioniert."')
+    ap.add_argument("--prompt", default="Antworte in einem kurzen Satz auf die "
+                                        "gehörte Frage: {{transcript}}")
+    ap.add_argument("--model", default="", help="providerID/modelID ('' = server default)")
+    ap.add_argument("--system", default="", help="system prompt for the action")
     ap.add_argument("--listen", type=float, default=45.0,
                     help="seconds to wait for the answer")
     ap.add_argument("--language", default="", help="whisper language hint, e.g. de")
@@ -130,8 +133,10 @@ def main() -> int:
         room_file.write_text(room_id + "\n")
     print(f"test room: {room_id}")
 
-    call_cfg = CallConfig(enabled=True, commands=[args.command], max_seconds=300,
-                          language=args.language, rooms=[room_id])
+    call_cfg = CallConfig(
+        enabled=True, max_seconds=300, language=args.language, rooms=[room_id],
+        action=Action(prompt=args.prompt, system=args.system, model=args.model,
+                      timeout=120))
     mgr = CallManager(bot, call_cfg, on_log=lambda m: print(f"[bot] {m}"))
     if mgr.speech is None:
         print("VOICE_BASE_URL is not set", file=sys.stderr)

@@ -13,7 +13,11 @@
 #   2. writes /etc/systemd/system/matrix-webhooker.service
 #      (runs as the user who deployed it, WorkingDirectory = this directory,
 #      the app loads .env / bots.json from there — same as `python3 server.py`);
-#   3. daemon-reload + enable + start.
+#   3. if the `opencode` CLI is installed: generates OPENCODE_SERVER_PASSWORD
+#      into .env (when missing) and writes /etc/systemd/system/opencode.service
+#      — a headless `opencode serve --port 4096` on 127.0.0.1 that trigger and
+#      call actions run on;
+#   4. daemon-reload + enable + start for both units.
 #
 # Afterwards:
 #   systemctl status matrix-webhooker          # unit status
@@ -26,6 +30,8 @@ APP_DIR="$(pwd -P)"
 
 SERVICE=matrix-webhooker
 UNIT=/etc/systemd/system/matrix-webhooker.service
+OC_SERVICE=opencode
+OC_UNIT=/etc/systemd/system/opencode.service
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -42,8 +48,12 @@ else
   SUDO=
 fi
 # The service must run as the human who deploys it: it reads their .env /
-# bots.json and executes their trigger commands (e.g. `opencode run`).
-if [ -n "${SUDO_USER:-}" ]; then
+# bots.json and its actions run as that user's OpenCode server.
+# MW_RUN_USER overrides the detection (needed when the script itself is run
+# through a root wrapper where SUDO_USER stays empty).
+if [ -n "${MW_RUN_USER:-}" ]; then
+  RUN_USER=$MW_RUN_USER
+elif [ -n "${SUDO_USER:-}" ]; then
   RUN_USER=$SUDO_USER
 else
   RUN_USER=$(id -un)
@@ -141,13 +151,13 @@ PY_BIN="$VENV/bin/python"
 # The app loads .env itself (python-dotenv), so no EnvironmentFile is needed.
 # Restart=always + enable mirrors the Docker `restart: unless-stopped` setup:
 # back after crashes and reboots, until explicitly stopped.
-# PATH keeps $HOME/.opencode/bin ahead of /usr/bin: the system package is an
-# old opencode that lacks the flags the trigger commands use (e.g. --standalone).
+# PATH keeps $HOME/.local/bin and $HOME/.opencode/bin ahead of /usr/bin so
+# tools reached through the OpenCode server use user-installed versions.
 UNIT_CONTENT=$(cat <<EOF
 [Unit]
 Description=MatrixWebhooker — webhook to Matrix bridge (multi-bot)
 Documentation=file://$APP_DIR/README.md
-After=network-online.target
+After=network-online.target $OC_SERVICE.service
 Wants=network-online.target
 StartLimitIntervalSec=600
 StartLimitBurst=5
@@ -174,22 +184,79 @@ trap 'rm -f "$TMP_UNIT"' EXIT
 printf '%s\n' "$UNIT_CONTENT" > "$TMP_UNIT"
 run install -m 0644 "$TMP_UNIT" "$UNIT"
 
+# --- OpenCode server unit (trigger/call actions run on it) --------------------
+# `opencode serve` binds 127.0.0.1 and authenticates Basic-auth user
+# "opencode" against OPENCODE_SERVER_PASSWORD (read from .env via
+# EnvironmentFile; systemd's KEY=value format matches python-dotenv's).
+find_opencode() {  # sudo resets PATH, so check the user's install dirs too
+  local d
+  for d in "$RUN_HOME/.opencode/bin" "$RUN_HOME/.local/bin"; do
+    if [ -x "$d/opencode" ]; then echo "$d/opencode"; return 0; fi
+  done
+  command -v opencode 2>/dev/null && return 0
+  return 1
+}
+
+OPENCODE_BIN=$(find_opencode || true)
+if [ -z "$OPENCODE_BIN" ]; then
+  echo "NOTE: 'opencode' CLI not found for $RUN_USER — skipping the $OC_SERVICE unit."
+  echo "      Trigger/call actions need one: install opencode and re-run this script."
+else
+  if ! grep -qs '^OPENCODE_SERVER_PASSWORD=' "$APP_DIR/.env"; then
+    PW=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 43)
+    printf '\n# OpenCode server (written by linux_systemd_deploy.sh)\nOPENCODE_SERVER_URL=http://127.0.0.1:4096\nOPENCODE_SERVER_PASSWORD=%s\n' "$PW" >> "$APP_DIR/.env"
+    chmod 0600 "$APP_DIR/.env"
+    echo "Generated OPENCODE_SERVER_PASSWORD into $APP_DIR/.env"
+  fi
+  OC_UNIT_CONTENT=$(cat <<EOF
+[Unit]
+Description=OpenCode server — headless, for MatrixWebhooker actions
+Documentation=https://opencode.ai/v2/docs/api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$RUN_USER
+Group=$RUN_GROUP
+UMask=0027
+Environment=HOME=$RUN_HOME
+Environment=PATH=$RUN_HOME/.local/bin:$RUN_HOME/.opencode/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=$APP_DIR/.env
+ExecStart=$OPENCODE_BIN serve --hostname 127.0.0.1 --port 4096
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)
+  printf '%s\n' "$OC_UNIT_CONTENT" > "$TMP_UNIT"
+  run install -m 0644 "$TMP_UNIT" "$OC_UNIT"
+fi
+
 # --- register, enable, start -------------------------------------------------
 # Note: `enable --now` on an ALREADY RUNNING unit is a no-op for the process
 # (it keeps the old environment/config), so restart it explicitly.
 run systemctl daemon-reload
-run systemctl enable "$SERVICE"
-if run systemctl is-active --quiet "$SERVICE"; then
-  run systemctl restart "$SERVICE"
-else
-  run systemctl start "$SERVICE"
-fi
+for svc in "$OC_SERVICE" "$SERVICE"; do
+  [ -e "/etc/systemd/system/$svc.service" ] || continue
+  run systemctl enable "$svc"
+  if run systemctl is-active --quiet "$svc"; then
+    run systemctl restart "$svc"
+  else
+    run systemctl start "$svc"
+  fi
+done
 
 echo
 echo "✔ $SERVICE is installed and running"
 echo "    unit    : $UNIT"
 echo "    python  : $PY_BIN"
-echo "    user    : $RUN_USER   (runs its trigger commands as this user)"
+echo "    user    : $RUN_USER   (runs its actions via the OpenCode server)"
+if [ -n "$OPENCODE_BIN" ]; then
+  echo "    opencode: $OC_SERVICE on http://127.0.0.1:4096 (unit $OC_UNIT)"
+fi
 echo
 echo "  systemctl status $SERVICE"
 echo "  journalctl -u $SERVICE -f"

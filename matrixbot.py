@@ -5,7 +5,8 @@ Used by both ``server.py`` (HTTP API) and ``mcp_server.py`` (MCP tools).
 
 Configuration
 -------------
-``.env``       shared settings: homeserver, invite user, HTTP bind (no secrets)
+``.env``       shared settings: homeserver, invite user, HTTP bind, OpenCode
+               server (``OPENCODE_SERVER_URL`` / ``OPENCODE_SERVER_PASSWORD``)
 ``bots.json``  roster of bot accounts; each bot has its own Matrix login
                and its own API key for the webhook API (see bots.example.json)
 
@@ -28,6 +29,7 @@ from urllib.parse import quote, urlsplit
 import requests
 
 from crypto import BotCrypto, CryptoError
+from opencode_api import OpenCodeClient
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -42,18 +44,83 @@ class ConfigError(RuntimeError):
 
 
 @dataclass
+class Action:
+    """One OpenCode-server action (``bots.json`` -> ``"action"``).
+
+    Instead of spawning a shell command, the trigger/call talks to the
+    long-lived ``opencode serve`` (``OPENCODE_SERVER_URL``): a fresh session
+    per message, ``system`` as its instruction entry, ``prompt`` as the user
+    turn, and the final assistant text back out (posted to the room / spoken).
+
+    ``prompt``/``system`` may use the placeholders ``{{channel}}``,
+    ``{{msg}}`` (last ``context`` messages, newest last), ``{{sender}}``,
+    ``{{room}}`` and — for calls — ``{{transcript}}``; values are inserted
+    literally (no shell involved). ``model`` is ``providerID/modelID`` (like
+    ``opencode run -m``), empty = the server's default. ``template`` names a
+    entry from the top-level ``"templates"`` section of ``bots.json``; inline
+    fields override it.
+    """
+    prompt: str
+    system: str = ""
+    model: str = ""                 # providerID/modelID ('' = server default)
+    agent: str = ""                 # opencode agent id ('' = default agent)
+    directory: str = ""             # session location ('' = app directory)
+    timeout: int = 300              # seconds to wait for the answer
+    keep_session: bool = False      # keep the session after a successful run
+
+
+def action_from(raw, path: str, where: str, default_timeout: int,
+                templates: dict) -> Action:
+    """Parse/merge one ``"action"`` object (``template`` pulls in a named
+    entry from the global ``"templates"`` section; inline keys override)."""
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: {where}: 'action' must be an object")
+    merged: dict = {}
+    tname = raw.get("template")
+    if tname is not None:
+        tname = str(tname).strip()
+        tpl = templates.get(tname)
+        if tpl is None:
+            raise ConfigError(f"{path}: {where}: template '{tname}' is not in "
+                              'the top-level "templates" section')
+        merged.update(tpl)
+    merged.update({k: v for k, v in raw.items() if k != "template"})
+
+    prompt = str(merged.get("prompt") or "").strip()
+    if not prompt:
+        raise ConfigError(f"{path}: {where}: 'action.prompt' is required "
+                          "(via template or inline)")
+    try:
+        timeout = int(merged.get("timeout", default_timeout))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{path}: {where}: 'action.timeout' must be an "
+                          f"integer: {exc}") from exc
+    if not 5 <= timeout <= 3600:
+        raise ConfigError(f"{path}: {where}: 'action.timeout' must be between "
+                          "5 and 3600 seconds")
+    return Action(
+        prompt=prompt,
+        system=str(merged.get("system") or ""),
+        model=str(merged.get("model") or "").strip(),
+        agent=str(merged.get("agent") or "").strip(),
+        directory=str(merged.get("directory") or "").strip(),
+        timeout=timeout,
+        keep_session=bool(merged.get("keep_session", False)),
+    )
+
+
+@dataclass
 class Trigger:
     """Fires when the bot receives a message (not from itself) in one room.
 
     ``room`` matches the room's display name (case-insensitive) or a room id
-    (``!...``) — room ids are the reliable way to match DMs. ``commands`` are
-    bash command line(s) run in sequence in the app directory; the
-    placeholders ``{{channel}}`` (room name), ``{{msg}}`` (last ``context``
-    messages, newest last), ``{{sender}}`` and ``{{room}}`` (room id) are
-    substituted shell-quoted.
+    (``!...``) — room ids are the reliable way to match DMs. ``action`` runs
+    on the OpenCode server; its ``prompt`` gets ``{{channel}}``, ``{{msg}}``
+    (last ``context`` messages, newest last), ``{{sender}}`` and ``{{room}}``
+    substituted. The final assistant text is posted back into the room.
     """
     room: str
-    commands: list[str]
+    action: Action
     context: int = 25               # messages included in {{msg}} (max 100)
 
     def matches(self, room_id: str, room_name: str | None) -> bool:
@@ -66,25 +133,25 @@ class Trigger:
 class CallConfig:
     """Answering MatrixRTC (Element Call) calls — ``bots.json`` -> ``"call"``.
 
-    ``commands`` are bash command line(s) run per heard utterance; the last
-    one's stdout is what the bot speaks back.  On top of the trigger
-    placeholders they also get ``{{transcript}}`` (what was heard).
+    ``action`` runs per heard utterance on the OpenCode server; its final
+    assistant text is what the bot speaks back.  On top of the trigger
+    placeholders the prompt also gets ``{{transcript}}`` (what was heard);
+    ``action.timeout`` bounds one answer (default 90 s).
     ``rooms`` restricts which rooms the bot joins calls in (display names or
     ``!…`` ids); empty means every room the bot is a member of.
     """
     enabled: bool = False
-    commands: list[str] = field(default_factory=list)
+    action: Action | None = None
     context: int = 25
     rooms: list[str] = field(default_factory=list)
     max_seconds: int = 900
     greeting: str = ""
     language: str = ""
-    thinking_cue: str = "Einen Moment."   # spoken while the command is still running
+    thinking_cue: str = "Einen Moment."   # spoken while the action is still running
     cue_after: float = 2.0                # seconds before that cue
     log_transcripts: bool = True          # post heard + answer into the room
     max_answer_chars: int = 220   # spoken answers are clipped to this (tts is
                                   # ~3.5x the length of what it speaks)
-    max_command_seconds: int = 90  # a command that takes longer is killed
     sorry_line: str = "Das hat zu lange gedauert, frag bitte nochmal."
     vad_threshold: int = 400        # rms of 16-bit pcm that counts as speech
     echo_factor: float = 2.5        # while we speak, input must be this louder
@@ -105,20 +172,17 @@ class CallConfig:
         return False
 
 
-def call_config_from(entry: dict, path: Path) -> CallConfig:
+def call_config_from(entry: dict, path: Path, templates: dict) -> CallConfig:
     """Parse the optional ``"call"`` object of a bots.json entry."""
     raw = entry.get("call")
     if raw is None:
         return CallConfig()
     if not isinstance(raw, dict):
         raise ConfigError(f"{path}: bots[{entry.get('name')}] 'call' must be an object")
-    cmd = raw.get("command", raw.get("commands"))
-    if isinstance(cmd, str):
-        commands = [cmd]
-    elif isinstance(cmd, list):
-        commands = [str(c) for c in cmd]
-    else:
-        commands = []
+    action = None
+    if raw.get("action") is not None:
+        action = action_from(raw["action"], str(path),
+                             f"bots[{entry.get('name')}].call", 90, templates)
     rooms = raw.get("rooms") or []
     if not isinstance(rooms, list):
         raise ConfigError(f"{path}: 'call.rooms' must be a list of room names/ids")
@@ -133,7 +197,6 @@ def call_config_from(entry: dict, path: Path) -> CallConfig:
         max_utterance = float(raw.get("max_utterance", 20.0))
         cue_after = float(raw.get("cue_after", 2.0))
         max_answer_chars = int(raw.get("max_answer_chars", 220))
-        max_command_seconds = int(raw.get("max_command_seconds", 90))
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"{path}: 'call': numeric setting is not a number: {exc}") from exc
     if not 1 <= context <= 100:
@@ -142,7 +205,7 @@ def call_config_from(entry: dict, path: Path) -> CallConfig:
         raise ConfigError(f"{path}: 'call.max_seconds' must be between 30 and 7200")
     return CallConfig(
         enabled=bool(raw.get("enabled", True)),
-        commands=commands,
+        action=action,
         context=context,
         rooms=[str(r) for r in rooms],
         max_seconds=max_seconds,
@@ -152,7 +215,6 @@ def call_config_from(entry: dict, path: Path) -> CallConfig:
         cue_after=cue_after,
         log_transcripts=bool(raw.get("log_transcripts", True)),
         max_answer_chars=max_answer_chars,
-        max_command_seconds=max_command_seconds,
         sorry_line=str(raw.get("sorry_line",
                                "Das hat zu lange gedauert, frag bitte nochmal.")),
         vad_threshold=vad,
@@ -184,6 +246,9 @@ class Settings:
     port: int
     state_dir: Path
     bots: list[BotConfig] = field(default_factory=list)
+    templates: dict = field(default_factory=dict)  # named actions (bots.json)
+    opencode_url: str = "http://127.0.0.1:4096"    # opencode serve base URL
+    opencode_password: str = ""                    # Basic-auth password
 
 
 def bots_file() -> Path:
@@ -215,6 +280,16 @@ def load_settings() -> Settings:
     entries = raw.get("bots")
     if not isinstance(entries, list) or not entries:
         raise ConfigError(f"{path} must contain a non-empty \"bots\" list")
+
+    raw_templates = raw.get("templates") or {}
+    if not isinstance(raw_templates, dict):
+        raise ConfigError(f'{path}: "templates" must be an object '
+                          "(name -> action object)")
+    templates: dict[str, dict] = {}
+    for tname, traw in raw_templates.items():
+        if not isinstance(traw, dict):
+            raise ConfigError(f'{path}: templates["{tname}"] must be an object')
+        templates[str(tname)] = traw
 
     bots: list[BotConfig] = []
     for i, entry in enumerate(entries):
@@ -251,27 +326,25 @@ def load_settings() -> Settings:
             if not troom:
                 raise ConfigError(
                     f"{path}: bots[{i}] ('{name}').triggers[{j}]: 'room' (name or '!...' id) is required")
-            raw_cmd = t.get("command", t.get("commands"))
-            if isinstance(raw_cmd, str):
-                cmds = [raw_cmd]
-            elif isinstance(raw_cmd, list):
-                cmds = [str(c) for c in raw_cmd]
-            else:
+            where = f"bots[{i}] ('{name}').triggers[{j}]"
+            if t.get("command") is not None or t.get("commands") is not None:
                 raise ConfigError(
-                    f"{path}: bots[{i}] ('{name}').triggers[{j}]: "
-                    "'command' must be a string or a list of strings")
-            if not any(c.strip() for c in cmds):
-                raise ConfigError(f"{path}: bots[{i}] ('{name}').triggers[{j}]: "
-                                  "at least one non-empty command is required")
+                    f"{path}: {where}: 'command' was replaced by 'action' — "
+                    "the trigger now runs on the OpenCode server "
+                    "(see bots.example.json)")
+            if not isinstance(t.get("action"), dict):
+                raise ConfigError(f"{path}: {where}: 'action' must be an object "
+                                  "(optionally {\"template\": \"...\"})")
+            action = action_from(t["action"], str(path), where, 300, templates)
             try:
                 context = int(t.get("context", 25))
             except (TypeError, ValueError):
-                raise ConfigError(f"{path}: bots[{i}] ('{name}').triggers[{j}]: "
+                raise ConfigError(f"{path}: {where}: "
                                   "'context' must be an integer")
             if not 1 <= context <= 100:
-                raise ConfigError(f"{path}: bots[{i}] ('{name}').triggers[{j}]: "
+                raise ConfigError(f"{path}: {where}: "
                                   "'context' must be between 1 and 100")
-            triggers.append(Trigger(room=troom, commands=cmds, context=context))
+            triggers.append(Trigger(room=troom, action=action, context=context))
         bots.append(BotConfig(
             name=name,
             user=user,
@@ -280,7 +353,7 @@ def load_settings() -> Settings:
             room_id=room_id,
             room_name=str(entry.get("room_name") or "").strip() or None,
             triggers=triggers,
-            call=call_config_from(entry, path),
+            call=call_config_from(entry, path, templates),
         ))
 
     return Settings(
@@ -290,6 +363,10 @@ def load_settings() -> Settings:
         port=port,
         state_dir=state_dir,
         bots=bots,
+        templates=templates,
+        opencode_url=os.environ.get("OPENCODE_SERVER_URL", "").strip().rstrip("/") \
+            or "http://127.0.0.1:4096",
+        opencode_password=os.environ.get("OPENCODE_SERVER_PASSWORD", "").strip(),
     )
 
 
@@ -830,6 +907,7 @@ class Bot:
         state_dir.mkdir(parents=True, exist_ok=True)
         self.client = Matrix(settings.homeserver, cfg.user, cfg.password, state_dir)
         self._crypto: BotCrypto | None = None
+        self._opencode: OpenCodeClient | None = None
         #: set by server.py when the bot has "call" enabled (calls.CallManager)
         self.calls = None
 
@@ -846,6 +924,14 @@ class Bot:
                 on_log=lambda msg: print(f"[crypto:{self.name}] {msg}",
                                         file=sys.stderr))
         return self._crypto
+
+    @property
+    def opencode(self) -> OpenCodeClient:
+        """OpenCode server client (lazy; one per bot, thread-safe)."""
+        if self._opencode is None:
+            self._opencode = OpenCodeClient(self.settings.opencode_url,
+                                            self.settings.opencode_password)
+        return self._opencode
 
     @property
     def user_id(self) -> str:

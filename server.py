@@ -25,11 +25,12 @@ Message watching / triggers:
     room message the bot receives (not from itself):
       * a bare "stop" keyword (stop / /stop / STOP / STOP!!! -- starts with
         "stop", no whitespace) stops the current execution for that room:
-        kills the running trigger command, releases waiting models, removes
-        the wrench reactions, and replies with a short confirmation;
+        interrupts the running OpenCode action, releases waiting models,
+        removes the wrench reactions, and replies with a short confirmation;
       * otherwise it either hands the message to a client waiting via /wait,
-        or fires the bot's configured triggers -- bash command line(s) per
-        room with {{channel}}/{{msg}}/{{sender}}/{{room}}.
+        or fires the bot's configured triggers -- an "action" per room that
+        runs on the OpenCode server with {{channel}}/{{msg}}/{{sender}}/{{room}}
+        in its prompt and posts the answer back into the room.
     While a message is being handled the bot reacts to it with 🔧 and
     removes that reaction again as soon as handling is finished.
 Config: ``.env`` (shared settings) + ``bots.json`` (bot roster, secrets).
@@ -150,7 +151,8 @@ def me():
     return jsonify({"bot": bot.name, "user": bot.user_id,
                     "room": bot.room_id_cached_or_pinned(),
                     "triggers": [{"room": t.room, "context": t.context,
-                                  "commands": t.commands}
+                                  "model": t.action.model or "(default)",
+                                  "timeout": t.action.timeout}
                                  for t in bot.cfg.triggers]})
 
 
@@ -252,8 +254,9 @@ def main() -> None:
     watchers: list[MessageWatcher] = []
     for bot in BOTS.values():
         trig = [t.room for t in bot.cfg.triggers]
-        call = (f"call=on({len(bot.cfg.call.commands)} cmd)" if bot.cfg.call.enabled
-                else "call=off")
+        act = bot.cfg.call.action
+        call = (f"call=on({(act.model if act and act.model else 'default model')})"
+                if bot.cfg.call.enabled else "call=off")
         print(f"bot: {bot.name} ({bot.user_id}) "
               f"room={bot.room_id_cached_or_pinned() or '(resolved on first use)'} "
               f"triggers=[{', '.join(trig) or 'none'}] {call}")

@@ -87,11 +87,14 @@ Grafana, CI, ... ──HTTP──▶ MatrixWebhooker ──Matrix API──▶ p
    journalctl -u matrix-webhooker -f        # follow logs
    ```
 
-   It runs `server.py` directly as the deploying user (so trigger commands
-   like `opencode run` work outside Docker) with the working directory set
-   to the app directory — `.env` and `bots.json` are picked up from there.
+   It runs `server.py` directly as the deploying user with the working
+   directory set to the app directory — `.env` and `bots.json` are picked
+   up from there. If the `opencode` CLI is installed it *also* writes an
+   `opencode.service` unit (headless `opencode serve` on
+   `http://127.0.0.1:4096`, password generated into `.env`) — that is what
+   trigger/call actions run on.
    The unit's `PATH` puts `~/.local/bin` and `~/.opencode/bin` ahead of
-   `/usr/bin`, so trigger commands pick up user-installed tool versions.
+   `/usr/bin`, so tools pick up user-installed versions.
    Re-running the script while the service is running applies the updated
    unit and **restarts** the service (a bare `enable --now` on an already
    running unit would leave the old process in place).
@@ -99,13 +102,45 @@ Grafana, CI, ... ──HTTP──▶ MatrixWebhooker ──Matrix API──▶ p
    Uninstall: `systemctl disable --now matrix-webhooker
    && rm -f /etc/systemd/system/matrix-webhooker.service`.
 
+## OpenCode server (what actions run on)
+
+Triggers and calls do not spawn a CLI per message — they talk to one
+long-lived headless OpenCode instance:
+
+```sh
+OPENCODE_SERVER_PASSWORD=… opencode serve --hostname 127.0.0.1 --port 4096
+```
+
+Configure it in `.env`: `OPENCODE_SERVER_URL` (default
+`http://127.0.0.1:4096`) and `OPENCODE_SERVER_PASSWORD` (HTTP Basic auth,
+user `opencode`; without the env var `opencode serve` prints a random
+password at start). The systemd deploy script sets up an `opencode.service`
+unit for exactly this and generates the password into `.env`.
+
+Per action the server gets a **fresh session per message**: create
+(`POST /api/session` with model/agent/location), attach the system prompt
+(instruction entry), send the prompt, poll until the session is idle, take
+the final assistant text. Tool use runs headless (the default config asks
+no permission questions). Sessions are deleted after a successful run; a
+*failed* run keeps its session so you can inspect the turn in the TUI.
+
 ## Triggers (incoming messages)
 
 Beyond pushing alerts *into* Matrix, a bot can **react to messages it
-receives**. Add `triggers` to a bot entry in `bots.json`:
+receives**. Each trigger runs an **action** on the OpenCode server and
+posts the final answer back into the room. Add `triggers` to a bot entry
+in `bots.json` — and optionally named **templates** at the top level that
+triggers reference (and can override field by field):
 
 ```json
 {
+  "templates": {
+    "helper": {
+      "model": "ollama/bonsai-2:27b",
+      "system": "Du bist ein hilfreicher Assistent. Antworte sachlich auf Deutsch.",
+      "timeout": 300
+    }
+  },
   "bots": [
     {
       "name": "grafana_bot",
@@ -116,10 +151,13 @@ receives**. Add `triggers` to a bot entry in `bots.json`:
       "triggers": [
         {
           "room": "Grafana Bot Alerts",
-          "command": "opencode run --standalone -m ollama/qwen3.8:27b-mtp-q4_K_M-128k \"You got a new message in matrix channel {{channel}}: {{msg}}\"",
+          "action": {
+            "template": "helper",
+            "prompt": "Neue Nachricht in {{channel}} von {{sender}}:\n{{msg}}\nFasse kurz zusammen oder antworte, wenn eine Frage darin steckt."
+          },
           "context": 25
         },
-        { "room": "!...:domain", "command": ["curl -fsS https://example.local/hook", "logger -t mw 'triggered'"] }
+        { "room": "!...:domain", "action": { "template": "helper", "model": "ollama/bonsai-2:2b" } }
       ]
     }
   ]
@@ -129,33 +167,38 @@ receives**. Add `triggers` to a bot entry in `bots.json`:
 - `room` — the channel to listen in: the room's **display name**
   (case-insensitive) or a **room id** (`!…`). Use a room id for DMs (they
   have no display name). One bot can have many triggers.
-- `command` — one **bash** command line, or a list of them run in sequence
-  in the app directory. Placeholders are substituted (and shell-quoted, so
-  no injection/quoting worries):
-  - `{{channel}}` — the room's display name (or id if it has none)
-  - `{{msg}}` — the last `context` messages of the room, one per line,
-    newest last, e.g. `[2026-10-04 12:01:22] @user: deploy done`
-  - `{{sender}}` — the sender of the new message
-  - `{{room}}` — the room id
-  - `{{message_file}}` — a fresh per-run JSON file with the new message
-    (sender, ts, body, room)
-  - `{{history_file}}` — a fresh per-run JSON file with the last `context`
-    messages, oldest first / newest last (same content as `{{msg}}`, structured)
-
-  The command line is executed by `bash`, so keep the literal text
-  shell-safe: no unquoted `;`, `|`, `&`, `(`, `$`, quotes, … Placeholders
-  are shell-quoted automatically. For dynamic content, prefer the file
-  placeholders — programs read `message.json` / `history.json` from disk
-  (removed when the run finishes) instead of parsing the command line.
+- `templates` — top-level object of named action objects; reference one
+  with `"action": {"template": "name"}`, inline keys override it.
+- `action` — what runs on the OpenCode server:
+  - `prompt` — the user turn; placeholders are inserted **literally**
+    (there is no shell any more, so no quoting worries):
+    - `{{channel}}` — the room's display name (or id if it has none)
+    - `{{msg}}` — the last `context` messages of the room, one per line,
+      newest last, e.g. `[2026-10-04 12:01:22] @user: deploy done`
+    - `{{sender}}` — the sender of the new message
+    - `{{room}}` — the room id
+  - `system` — system prompt (attached as a session instruction entry)
+  - `model` — `providerID/modelID` (like `opencode run -m`); empty = the
+    server's default model
+  - `agent` — OpenCode agent id (empty = the default agent)
+  - `directory` — where the session runs; default is the **app directory**,
+    so the project's `opencode.json` applies — including the matrix MCP
+    tools (`send_message`, `wait_for_reply`, `read_messages`, …)
+  - `timeout` — seconds to wait for the answer (default 300)
+  - `keep_session` — keep the session after a *successful* run too
+    (default false)
 - `context` — how many messages `{{msg}}` holds (default `25`, max `100`).
+- **The answer is posted by the webhooker itself** — the final assistant
+  text becomes a room message. The agent can *additionally* use the matrix
+  MCP tools mid-run (e.g. to ask a clarifying question and
+  `wait_for_reply` for the answer).
 - A trigger fires only for a message **from someone else** — messages the
   bot itself sent are always skipped (no loops).
 - If a client is **waiting** for that room at the moment (see below), the
   message goes to the waiting client *instead of* the triggers.
-- Runs in a background thread; long commands (like a full `opencode run`)
-  don't block the watcher. Restart the server after editing `bots.json` to
-  load changes. In the slim Docker image there is no `bash`, so commands
-  fall back to `sh` — keep them POSIX-safe if you run Docker.
+- Runs in a background thread; long model turns (the watcher only polls
+  and waits) don't block the watcher. Restart the server after editing
+  `bots.json` to load changes.
 
 ### Waiting for a reply
 
@@ -165,7 +208,7 @@ Ask a question and block for the answer instead of firing a trigger:
   `timeout` seconds (max 600) for the next message in the room that is not
   from the bot itself: `{"received": {"sender", "body", "ts", ...}}`, or
   `{"received": null}` on timeout. Natural pattern for a conversational
-  trigger: the spawned `opencode run` can `send_message` a clarifying
+  trigger: the action's agent can `send_message` a clarifying
   question, then `wait_for_reply` for the human's answer — and that answer
   is handed to it directly, never re-triggering the bot.
 - **HTTP** `POST /wait` with `{"room_id": "!…", "timeout": 120}` — same
@@ -198,22 +241,16 @@ To interrupt the current execution in a room, just send a bare **`stop`**
 whole rule: a sentence that merely starts with "stop" such as
 `stop ollama.service` is a normal message, *not* a stop. On `stop` the bot:
 
-1. kills the running trigger command (SIGTERM the process group, then SIGKILL);
+1. interrupts the running action (OpenCode `session/<id>/interrupt` — the
+   model turn ends and no answer is posted);
 2. releases any model blocked in `wait_for_reply` for that room
    (`POST /wait` returns `{"stopped": true, "received": null}`);
 3. removes every wrench reaction it added for that room;
 4. replies with a short confirmation (`⏹ Stopped.` / `⏹ Stop sent …`).
 
-> **`opencode run` triggers need `--standalone`.** Without it, `opencode run`
-> is only a thin client: it submits the job to OpenCode's *shared background
-> service* (`opencode serve --service`) and streams the output. `stop` kills
-> the client's process group and the client dies (`exit -15`), but the shared
-> service keeps the model turn running and will **still post the answer** —
-> and killing the shared service outright would also kill your IDE's session.
-> With `--standalone`, the run executes in its own process tree, so the
-> process-group kill actually stops it. If you use any other long-lived tool
-> as a trigger, make sure it runs the work in-process (not in a shared
-> daemon) or `stop` has the same problem.
+> Since actions run inside the OpenCode server (nothing is spawned per
+> message), stopping is an API interrupt — the old `opencode run
+> --standalone` process-group caveat is gone.
 
 ## Voice calls (MatrixRTC / Element Call)
 
@@ -230,7 +267,11 @@ Per bot in `bots.json` (needs `requirements-call.txt` installed and the
 ```json
 "call": {
   "enabled": true,
-  "command": "opencode run --standalone -m … \"…: {{transcript}}\"",
+  "action": {
+    "template": "voice",
+    "prompt": "Gehörte Frage: {{transcript}}",
+    "timeout": 90
+  },
   "greeting": "Hallo, ich bin der Bot.",
   "rooms": ["Some Room"],        // optional; default: every room the bot is in
   "max_seconds": 600,
@@ -266,9 +307,10 @@ What has to be true for a call to work:
 How it behaves:
 
 - Each utterance (energy VAD: `vad_threshold`, `silence_end`, `min_speech`,
-  `max_utterance`) is sent to whisper. The command gets the usual placeholders
-  plus **`{{transcript}}`**, and its **stdout is what gets spoken** — keep
-  answers short, TTS costs roughly 3× the audio length.
+  `max_utterance`) is sent to whisper. The action's prompt gets the usual
+  placeholders plus **`{{transcript}}`**, and its **final assistant text is
+  what gets spoken** — keep answers short, TTS costs roughly 3× the audio
+  length.
 - Turn taking: while the bot speaks, incoming audio has to be
   `echo_factor` (default 2.5) times louder than `vad_threshold` to count —
   that is its own voice coming back through your microphone. Speak clearly
@@ -298,12 +340,10 @@ How it behaves:
   ```
 
   The agent is usually the slow part (it may search the web), so
-  `max_command_seconds` (default 90) kills a command that runs longer and
+  `action.timeout` (default 90) interrupts an action that runs longer and
   speaks `sorry_line` instead of leaving the caller in silence.
-  Like the trigger commands, this is a **bash command line**: the placeholders
-  are substituted shell-quoted, but the rest of the text is not — so quote your
-  prompt or leave out `(`, `)`, `;`, `|`, `&`, `$` (an unquoted parenthesis is
-  a bash syntax error and the answer silently stays empty).
+  The prompt is plain text — placeholders are inserted literally, there is
+  no shell quoting to think about.
 - A bare `stop` in the room hangs the call up; so does the last other
   participant leaving, the MatrixRTC slot closing, or `max_seconds`.
 - `GET /health` lists the active calls per bot.

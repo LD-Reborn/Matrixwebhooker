@@ -8,36 +8,29 @@ bot receives — any channel it is in, including DMs — in this order:
   1. messages sent by the bot itself are ignored (never a trigger);
   2. a bare "stop" keyword (``stop`` / ``/stop`` / ``STOP`` / ``STOP!!!`` —
      starts with "stop" and contains no whitespace) halts the current
-     execution for that room: the running trigger command is killed, any
-     pending waiters (a model blocked in ``wait_for_reply``) are released,
-     and every wrench reaction added while it was handled is removed again.
-     The stop command is never delivered to a waiter or fired as a trigger.
-     The kill is a signal to the command's *process group*, so the work must
-     actually run inside that process tree: e.g. ``opencode run`` needs
-     ``--standalone`` — without it it is only a client of the shared OpenCode
-     background service, and killing the client would leave that service
-     running the turn (and posting the answer);
+     execution for that room: every OpenCode session the running trigger
+     started is interrupted (``opencode_api``), any pending waiters (a model
+     blocked in ``wait_for_reply``) are released, and every wrench reaction
+     added while it was handled is removed again.  The stop command is never
+     delivered to a waiter or fired as a trigger.
   3. if a client is waiting for a reply in that room (``POST /wait``, or
      the MCP ``wait_for_reply`` tool), the message is handed to the oldest
      waiter instead of running any triggers.  While a trigger run for that
      room is still in flight, the delivered message is additionally marked
      with the wrench reaction (see below);
   4. otherwise every trigger of the bot whose room matches is fired in a
-     background thread: the bash command line(s) with ``{{channel}}``,
-     ``{{msg}}`` (last ``context`` messages, newest last), ``{{sender}}``,
-     ``{{room}}``, ``{{message_file}}`` and ``{{history_file}}``
-     placeholders (values are shell-quoted), run in the app directory with
-     ``bash`` (falls back to ``sh`` if no bash, e.g. in the slim Docker
-     image).  The file placeholders point at JSON files (fresh per run,
-     removed after the command(s) exit) so dynamic content can be handed to
-     a program without any shell-quoting issues.
+     background thread: its ``action`` runs on the OpenCode server
+     (``opencode_api.py``) — a fresh session per message with the
+     ``{{channel}}``, ``{{msg}}`` (last ``context`` messages, newest last),
+     ``{{sender}}`` and ``{{room}}`` placeholders substituted into the
+     prompt — and the final assistant text is posted back into the room.
 
 Wrench feedback (🔧):
     Whenever a message is *handled* — a trigger for its room is fired, or it
     is delivered to a model that is already waiting for a reply in that room
     while that trigger run is still in flight — the bot reacts to it with the
     wrench emoji ``🔧``.  As soon as handling of that message is finished
-    (the trigger command(s) exit, or the room's "stop" command is received),
+    (the trigger action ends, or the room's "stop" command is received),
     the reaction is removed again (the reaction event is redacted), so you
     can tell at a glance which messages the bot is still working on.
 
@@ -49,14 +42,8 @@ suppression always live in exactly one process (no double-firing).
 from __future__ import annotations
 
 import json
-import os
 import re
-import shlex
-import shutil
-import signal
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections import deque
@@ -64,6 +51,7 @@ from pathlib import Path
 
 from crypto import CryptoError
 from matrixbot import BASE_DIR, Bot, MatrixError
+from opencode_api import OpenCodeError
 
 #: Hard cap (seconds) for POST /wait and the MCP wait_for_reply tool.
 MAX_WAIT_SECONDS = 600
@@ -179,82 +167,16 @@ def format_history(messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
-#: Per-run JSON context lives here (one sub-directory per fired trigger).
-CONTEXT_DIR = BASE_DIR / ".trigger-context"
+def render_text(template: str, values: dict[str, str]) -> str:
+    """Replace {{placeholder}} with the values, inserted literally.
 
-#: Context directories older than this are removed on the next trigger fire
-#: (covers runs that were killed and never got a chance to clean up).
-CONTEXT_TTL_SECONDS = 24 * 3600
-
-
-def _sweep_stale_context() -> None:
-    try:
-        for entry in CONTEXT_DIR.iterdir():
-            try:
-                if time.time() - entry.stat().st_mtime > CONTEXT_TTL_SECONDS:
-                    shutil.rmtree(entry, ignore_errors=True)
-            except OSError:
-                pass
-    except OSError:  # directory missing: nothing to sweep
-        pass
-
-
-def write_context_files(room_id: str, room_name: str | None, ev: dict,
-                        history: list[dict]) -> tuple[str, str]:
-    """Write this message and the recent room history as JSON into a fresh
-    per-run directory and return ``(message_file, history_file)``.
-
-    ``message.json``  — the triggering message (raw body).
-    ``history.json``  — the last ``context`` messages, oldest first, newest
-                        last (the same content ``{{msg}}`` renders, structured).
-
-    Files are 0600, the directory 0700 (/tmp-backed tools aside, this may sit
-    inside the app directory, see CONTEXT_DIR).
+    (No shell is involved any more — the old command lines needed
+    shell-quoting, an action prompt does not.)
     """
-    _sweep_stale_context()
-    CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-    run_dir = tempfile.mkdtemp(prefix="trig-", dir=str(CONTEXT_DIR))
-    common = {"room_id": room_id, "channel": room_name or room_id}
-    payloads = {
-        "message.json": {**common,
-                         "sender": ev.get("sender"),
-                         "ts": ev.get("ts"),
-                         "body": ev.get("body")},
-        "history.json": {**common,
-                         "oldest_first": True,
-                         "messages": [{"ts": m.get("ts"),
-                                       "sender": m.get("sender"),
-                                       "body": m.get("body")}
-                                      for m in history]},
-    }
-    for name, payload in payloads.items():
-        path = os.path.join(run_dir, name)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
-        os.chmod(path, 0o600)
-    return (os.path.join(run_dir, "message.json"),
-            os.path.join(run_dir, "history.json"))
-
-
-def render(template: str, values: dict[str, str]) -> str:
-    """Replace {{placeholder}} with shell-quoted values (safe to embed)."""
     out = template
     for key, value in values.items():
-        out = out.replace("{{%s}}" % key, shlex.quote(value))
+        out = out.replace("{{%s}}" % key, value)
     return out
-
-
-def _shell_prefix() -> list[str]:
-    return ["bash", "-c"] if shutil.which("bash") else ["sh", "-c"]
-
-
-def _signal_group(proc: subprocess.Popen, sig: int) -> None:
-    """Signal the whole process group of ``proc`` (it was started with its own
-    session), so we also reach the children of ``bash -c`` (e.g. ``opencode``)."""
-    try:
-        os.killpg(os.getpgid(proc.pid), sig)
-    except (ProcessLookupError, PermissionError) as exc:
-        _log(f"  killpg(pid={proc.pid}, sig={sig!r}) failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -263,17 +185,17 @@ def _signal_group(proc: subprocess.Popen, sig: int) -> None:
 
 
 class _Session:
-    """One in-flight run of a bot's triggers in a single room: the command
-    process(es) currently running, the wrench-reaction events added on the
+    """One in-flight run of a bot's triggers in a single room: the OpenCode
+    session ids started for it, the wrench-reaction events added on the
     room's behalf while it runs, and its state.  Wrench removal happens
     exactly once (whichever of the run's end / a stop claim wins it via
     ``cleaned``)."""
 
-    __slots__ = ("room_id", "procs", "reactions", "cancelled", "cleaned")
+    __slots__ = ("room_id", "session_ids", "reactions", "cancelled", "cleaned")
 
     def __init__(self, room_id: str) -> None:
         self.room_id = room_id
-        self.procs: list[subprocess.Popen] = []
+        self.session_ids: list[str] = []
         self.reactions: list[str] = []
         self.cancelled = False
         self.cleaned = False
@@ -618,25 +540,17 @@ class MessageWatcher:
 
     # -- stop keyword ---------------------------------------------------------
 
-    def _kill_running(self, sess: _Session) -> None:
-        """Terminate the session's still-running command(s): SIGTERM the whole
-        process group, wait briefly, then SIGKILL survivors."""
+    def _interrupt_sessions(self, sess: _Session) -> None:
+        """Interrupt every OpenCode session this run started (best-effort)."""
         with self._session_lock:
-            procs = [p for p in sess.procs if p.poll() is None]
-        if not procs:
+            ids = list(sess.session_ids)
+        if not ids:
             return
-        for p in procs:
-            _signal_group(p, signal.SIGTERM)
-        deadline = time.monotonic() + 3.0
-        for p in procs:
+        for sid in ids:
             try:
-                p.wait(timeout=max(0.0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                _signal_group(p, signal.SIGKILL)
-                try:
-                    p.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    _log(f"{self.tag} pid {p.pid} did not die")
+                self.bot.opencode.interrupt(sid)
+            except OpenCodeError as exc:
+                _log(f"{self.tag} interrupting {sid} failed: {exc}")
 
     def _ack_stop(self, room_id: str, message: str) -> None:
         try:
@@ -646,14 +560,14 @@ class MessageWatcher:
             _log(f"{self.tag} sending stop acknowledgment failed: {exc}")
 
     def _stop_room(self, room_id: str, where: str) -> None:
-        """Handle a bare "stop" in ``room_id``: kill the run, release waiters,
-        leave any call and clean up the wrench reactions."""
+        """Handle a bare "stop" in ``room_id``: interrupt the run, release
+        waiters, leave any call and clean up the wrench reactions."""
         key = room_id.casefold()
         with self._session_lock:
             active = list(self._sessions.get(key, []))
         for sess in active:
             sess.cancelled = True
-            self._kill_running(sess)
+            self._interrupt_sessions(sess)
             self._clean_up(sess)
         cancelled = self.waiters.cancel(self.bot.name, room_id)
         calls = getattr(self.bot, "calls", None)
@@ -729,7 +643,7 @@ class MessageWatcher:
                 sess.reactions.append(rid)
 
         try:
-            self._run_commands(tag, trig, sess, room_id, ev)
+            self._run_action(tag, trig, sess, room_id, ev)
         finally:
             with self._session_lock:
                 live = self._sessions.get(key)
@@ -738,8 +652,8 @@ class MessageWatcher:
             self._clean_up(sess)
             _log(f"{tag} run finished for {room_id}")
 
-    def _run_commands(self, tag: str, trig, sess: _Session,
-                      room_id: str, ev: dict) -> None:
+    def _run_action(self, tag: str, trig, sess: _Session,
+                    room_id: str, ev: dict) -> None:
         room_name = ev.get("room_name")
         try:
             history = self.bot.client.read_messages(room_id, limit=trig.context,
@@ -757,53 +671,41 @@ class MessageWatcher:
             "sender": ev.get("sender") or "",
             "msg": format_history(history),
         }
-        # JSON files for the command(s) to read ({{message_file}} /
-        # {{history_file}}) — dynamic content stays out of the shell line.
-        values["message_file"], values["history_file"] = write_context_files(
-            room_id, room_name, ev, history)
-        env = dict(
-            os.environ,
-            MATRIX_BOT=self.bot.name,
-            MATRIX_ROOM=room_id,
-            MATRIX_CHANNEL=room_name or room_id,
-            # Convenience default for the matrix MCP tools in the spawned run.
-            MCP_BOT=self.bot.name,
-        )
-        prefix = _shell_prefix()
-        for command in trig.commands:
-            if sess.cancelled:
-                _log(f"{tag} cancelled before command: {command[:80]}")
-                break
-            cmdline = render(command, values)
-            _log(f"{tag} run: {cmdline[:300]}")
-            started = time.monotonic()
-            try:
-                proc = subprocess.Popen(prefix + [cmdline], env=env, cwd=str(BASE_DIR),
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        text=True, start_new_session=True)
-            except Exception as exc:  # noqa: BLE001
-                _log(f"{tag} failed to start: {exc!r}")
-                continue
+        action = trig.action
+        if sess.cancelled:
+            _log(f"{tag} cancelled before the action started")
+            return
+        started = time.monotonic()
+
+        def _note_session(sid: str) -> None:
             with self._session_lock:
-                sess.procs.append(proc)
-            try:
-                out, err = proc.communicate()
-            except Exception as exc:  # noqa: BLE001
-                out, err = "", ""
-                _log(f"{tag} error while reaping command: {exc!r}")
-            finally:
-                with self._session_lock:
-                    try:
-                        sess.procs.remove(proc)
-                    except ValueError:
-                        pass
-            dt = time.monotonic() - started
-            if proc.returncode == 0:
-                _log(f"{tag} done (exit 0, {dt:.1f}s)")
-            else:
-                tail = ((str(err or out) or "") + "\n").strip()[-500:]
-                _log(f"{tag} exit {proc.returncode} after {dt:.1f}s: {tail}")
+                sess.session_ids.append(sid)
+
+        result = self.bot.opencode.run(
+            title=f"MatrixWebhooker {self.bot.name} {room_name or room_id}",
+            prompt=render_text(action.prompt, values),
+            system=action.system, model=action.model, agent=action.agent,
+            directory=action.directory or str(BASE_DIR),
+            timeout=action.timeout, cancel=lambda: sess.cancelled,
+            keep_session=action.keep_session, on_session=_note_session,
+            log=lambda m: _log(f"{tag} {m}"))
+        dt = time.monotonic() - started
+        if result.outcome == "succeeded":
+            _log(f"{tag} answered in {dt:.1f}s ({len(result.text)} chars)")
+            if result.text and not sess.cancelled:
+                try:
+                    self.bot.client.send_message(
+                        room_id, {"msgtype": "m.text", "body": result.text})
+                except MatrixError as exc:
+                    _log(f"{tag} posting the answer failed: {exc}")
+            elif not result.text:
+                _log(f"{tag} the model produced no text — nothing to post")
+        elif result.outcome == "timeout":
+            _log(f"{tag} no answer after {dt:.1f}s (action.timeout)")
+        elif result.outcome == "interrupted":
+            _log(f"{tag} interrupted after {dt:.1f}s")
+        else:
+            _log(f"{tag} action failed after {dt:.1f}s: {result.error} "
+                 f"(session {result.session_id} kept for inspection)")
         if sess.cancelled:
             _log(f"{tag} stopped by user command")
-        # The command(s) are done; their context files are no longer needed.
-        shutil.rmtree(os.path.dirname(values["message_file"]), ignore_errors=True)
