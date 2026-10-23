@@ -566,6 +566,7 @@ class CallSession:
             prompt=render_text(action.prompt, values),
             system=action.system, model=action.model, agent=action.agent,
             directory=action.directory or str(BASE_DIR),
+            variant=self.bot.effort.get(self.room_id),
             timeout=action.timeout, cancel=lambda: self.stopping.is_set(),
             keep_session=action.keep_session,
             log=lambda m: _log(f"{self.tag} {m}"))

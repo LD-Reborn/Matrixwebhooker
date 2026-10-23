@@ -13,6 +13,13 @@ bot receives — any channel it is in, including DMs — in this order:
      blocked in ``wait_for_reply``) are released, and every wrench reaction
      added while it was handled is removed again.  The stop command is never
      delivered to a waiter or fired as a trigger.
+  2b. ``/effort`` (list the reasoning-effort levels of the room) and
+      ``/effort <default|low|mid|high|xhigh>`` (set it for the room, persisted
+      in the bot's state dir) — the room's level becomes the model
+      ``variant`` of every action run started in that room afterwards.
+  2c. ``/btw <text>`` interjects into the action(s) currently running for
+      that room (OpenCode inbox ``steer`` delivery) instead of starting a
+      new run or feeding a waiter.
   3. if a client is waiting for a reply in that room (``POST /wait``, or
      the MCP ``wait_for_reply`` tool), the message is handed to the oldest
      waiter instead of running any triggers.  While a trigger run for that
@@ -80,6 +87,49 @@ def is_stop_command(body: str | None) -> bool:
     if not text or re.search(r"\s", text):
         return False
     return text.casefold().lstrip("/").rstrip("!?.…:;") == "stop"
+
+
+#: the reasoning-effort levels ``/effort`` accepts, mapped to the OpenCode
+#: model variants the model catalog uses ("mid" is the friendly alias of
+#: "medium"; "default" clears the room's override = the model's own default)
+EFFORT_LEVELS = ("default", "low", "mid", "high", "xhigh")
+EFFORT_VARIANTS = {"low": "low", "mid": "medium", "medium": "medium",
+                   "high": "high", "xhigh": "xhigh"}
+
+_BTW_RE = re.compile(r"^/btw\b[\s,]*(.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def parse_effort_command(body: str | None) -> tuple[bool, str]:
+    """True for ``/effort`` or ``/effort <level>`` — and nothing else.
+
+    The whole message must be the command (leading ``/`` required, case
+    ignored); the optional argument is returned stripped and lowercased,
+    ``""`` for the bare list form.
+    """
+    if not body:
+        return False, ""
+    text = body.strip()
+    if not text.startswith("/"):
+        return False, ""
+    head, _, rest = text.partition(" ")
+    if head.casefold().lstrip("/").rstrip("!?.…:;") != "effort":
+        return False, ""
+    return True, rest.strip().casefold().rstrip("!?.…:;")
+
+
+def parse_btw_command(body: str | None) -> tuple[bool, str]:
+    """True for ``/btw <text>`` — an interjection for a running action.
+
+    The leading ``/`` is required: a plain "btw …" in chat stays a normal
+    message.  Returns the interjection text (may be empty for a bare
+    ``/btw``, which the caller answers with the usage note).
+    """
+    if not body:
+        return False, ""
+    m = _BTW_RE.match(body.strip())
+    if m is None:
+        return False, ""
+    return True, m.group(1).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -552,12 +602,13 @@ class MessageWatcher:
             except OpenCodeError as exc:
                 _log(f"{self.tag} interrupting {sid} failed: {exc}")
 
-    def _ack_stop(self, room_id: str, message: str) -> None:
+    def _send_note(self, room_id: str, message: str) -> None:
+        """Post a short command-acknowledgment text into the room."""
         try:
             self.bot.client.send_message(room_id,
                                          {"msgtype": "m.text", "body": message})
         except MatrixError as exc:
-            _log(f"{self.tag} sending stop acknowledgment failed: {exc}")
+            _log(f"{self.tag} sending the command reply failed: {exc}")
 
     def _stop_room(self, room_id: str, where: str) -> None:
         """Handle a bare "stop" in ``room_id``: interrupt the run, release
@@ -582,9 +633,84 @@ class MessageWatcher:
             ack = "⏹ Left the call."
         else:
             ack = "⏹ Nothing was running."
-        self._ack_stop(room_id, ack)
+        self._send_note(room_id, ack)
         _log(f"{self.tag} {where} -> stopped: {len(active)} run(s), "
              f"{cancelled} waiter(s) released, call left={hung_up}")
+
+    # -- /effort command --------------------------------------------------------
+
+    def _effort_room(self, room_id: str, level: str) -> None:
+        """``/effort`` lists the room's levels, ``/effort <level>`` sets one.
+
+        The setting is per room and persists across restarts (the bot's
+        state dir); every action run started in the room afterwards gets it
+        as its model ``variant``.
+        """
+        store = self.bot.effort
+        levels = ", ".join(EFFORT_LEVELS)
+        if not level:
+            current = store.get(room_id) or "default"
+            self._send_note(room_id,
+                            f"⚙️ Effort in this room: {current}. "
+                            f"Levels: {levels} — set with /effort <level>.")
+            return
+        if level == "default":
+            store.set(room_id, "")
+            self._send_note(room_id, "⚙️ Effort reset to the model default.")
+        elif level in EFFORT_VARIANTS:
+            store.set(room_id, EFFORT_VARIANTS[level])
+            self._send_note(room_id, f"⚙️ Effort in this room: {level}.")
+        else:
+            self._send_note(room_id, f"⚙️ Unknown effort level '{level}'. "
+                                     f"Levels: {levels}.")
+        _log(f"{self.tag} /effort {level or '(list)'} for {room_id} "
+             f"-> {store.get(room_id) or 'default'}")
+
+    # -- /btw command -----------------------------------------------------------
+
+    def _btw_room(self, room_id: str, text: str, ev: dict) -> None:
+        """``/btw <text>``: interject into the action(s) running in the room.
+
+        Each in-flight run's newest OpenCode session gets the text as a
+        ``steer`` prompt — the running turn sees it without a new run being
+        started.  The message gets the usual wrench while handling lasts.
+        """
+        if not text:
+            self._send_note(room_id, "📣 Usage: /btw <text> — interject into "
+                                     "the action running in this room.")
+            return
+        key = room_id.casefold()
+        with self._session_lock:
+            live = list(self._sessions.get(key, []))
+        targets: list[tuple[_Session, str]] = []
+        for sess in live:
+            with self._session_lock:
+                ids = list(sess.session_ids)
+            if ids:
+                targets.append((sess, ids[-1]))
+        if not targets:
+            self._send_note(room_id, "📣 Nothing is running in this room — "
+                                     "/btw interjects into a running action.")
+            return
+        delivered = 0
+        for sess, sid in targets:
+            try:
+                self.bot.opencode.steer(sid, text)
+                delivered += 1
+            except OpenCodeError as exc:
+                _log(f"{self.tag} /btw steer {sid} failed: {exc}")
+        if delivered:
+            rid = self._react_on(room_id, ev.get("event_id"))
+            if rid:
+                with self._session_lock:
+                    targets[0][0].reactions.append(rid)
+            self._send_note(room_id, f"📣 Interjection delivered to "
+                                     f"{delivered} running action(s).")
+        else:
+            self._send_note(room_id, "📣 Could not deliver the interjection "
+                                     "(the run may have just ended).")
+        _log(f"{self.tag} /btw for {room_id} -> {delivered}/{len(targets)} "
+             f"session(s) steered")
 
     # -- per-message pipeline ---------------------------------------------------
 
@@ -597,6 +723,16 @@ class MessageWatcher:
 
         if is_stop_command(ev.get("body")):
             self._stop_room(room_id, where)
+            return
+
+        is_effort, level = parse_effort_command(ev.get("body"))
+        if is_effort:
+            self._effort_room(room_id, level)
+            return
+
+        is_btw, btw_text = parse_btw_command(ev.get("body"))
+        if is_btw:
+            self._btw_room(room_id, btw_text, ev)
             return
 
         if self.waiters.deliver(self.bot.name, room_id, ev):
@@ -686,6 +822,7 @@ class MessageWatcher:
             prompt=render_text(action.prompt, values),
             system=action.system, model=action.model, agent=action.agent,
             directory=action.directory or str(BASE_DIR),
+            variant=self.bot.effort.get(room_id),
             timeout=action.timeout, cancel=lambda: sess.cancelled,
             keep_session=action.keep_session, on_session=_note_session,
             log=lambda m: _log(f"{tag} {m}"))

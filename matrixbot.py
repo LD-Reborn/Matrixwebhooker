@@ -899,6 +899,50 @@ class Matrix:
 # ---------------------------------------------------------------------------
 
 
+class EffortStore:
+    """Per-room reasoning-effort override, set with the room's ``/effort``.
+
+    Maps room id (casefolded) to an OpenCode model variant (``low`` /
+    ``medium`` / ``high`` / ``xhigh``); no entry means the model's default
+    effort.  Persisted in the bot's state dir so a restart keeps every
+    room's setting.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._levels: dict[str, str] = {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self._levels = {str(k).casefold(): str(v)
+                                for k, v in data.items()}
+        except (OSError, ValueError):
+            pass
+
+    def get(self, room_id: str) -> str:
+        """The room's model variant, or ``""`` for the model default."""
+        with self._lock:
+            return self._levels.get(room_id.casefold(), "")
+
+    def set(self, room_id: str, variant: str) -> None:
+        """Set the room's variant (``""`` resets it to the model default)."""
+        key = room_id.casefold()
+        with self._lock:
+            if variant:
+                self._levels[key] = variant
+            else:
+                self._levels.pop(key, None)
+            snapshot = dict(self._levels)
+        try:
+            self._path.write_text(
+                json.dumps(snapshot, indent=1, sort_keys=True),
+                encoding="utf-8")
+        except OSError as exc:
+            print(f"[effort] saving {self._path} failed: {exc}",
+                  file=sys.stderr)
+
+
 class Bot:
     def __init__(self, cfg: BotConfig, settings: Settings):
         self.cfg = cfg
@@ -906,6 +950,8 @@ class Bot:
         state_dir = settings.state_dir / cfg.name
         state_dir.mkdir(parents=True, exist_ok=True)
         self.client = Matrix(settings.homeserver, cfg.user, cfg.password, state_dir)
+        #: per-room /effort overrides (room id -> OpenCode model variant)
+        self.effort = EffortStore(state_dir / "effort.json")
         self._crypto: BotCrypto | None = None
         self._opencode: OpenCodeClient | None = None
         #: set by server.py when the bot has "call" enabled (calls.CallManager)

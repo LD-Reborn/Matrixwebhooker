@@ -10,7 +10,8 @@ password ``opencode serve`` prints when the env var is not set).
 Flow per action (verified against opencode v2.1.4):
 
   1. ``POST /api/session``            create a fresh session (title, model
-     ``{providerID, id}``, agent, location ``{directory}``);
+     ``{providerID, id[, variant]}`` — the variant is the room's ``/effort``,
+     agent, location ``{directory}``);
   2. ``PUT /api/experimental/session/<id>/instructions/entries/<key>``
      attach the system prompt (a durable instruction entry);
   3. ``POST /api/session/<id>/prompt``  admit the user text (async);
@@ -79,10 +80,11 @@ class OpenCodeClient:
         self.http = requests.Session()
         self.http.auth = ("opencode", password)
 
-    def _req(self, method: str, path: str, body: dict | None = None) -> dict:
+    def _req(self, method: str, path: str, body: dict | None = None,
+             params: dict | None = None) -> dict:
         try:
             resp = self.http.request(method, self.base + path, json=body,
-                                     timeout=REQUEST_TIMEOUT)
+                                     params=params, timeout=REQUEST_TIMEOUT)
         except requests.RequestException as exc:
             raise OpenCodeError(f"{self.base}{path}: {exc}") from exc
         if resp.status_code >= 400:
@@ -101,12 +103,31 @@ class OpenCodeClient:
 
     # -- single steps -----------------------------------------------------------
 
+    def default_model(self, directory: str = "") -> tuple[str, str]:
+        """The server's default model for a location -> ``(providerID, id)``."""
+        params = ({"location[directory]": os.path.abspath(directory)}
+                  if directory else None)
+        data = self._req("GET", "/api/model/default", params=params).get("data") or {}
+        provider = data.get("providerID")
+        mid = data.get("modelID") or data.get("id")
+        if not provider or not mid:
+            raise OpenCodeError(f"default model lookup returned no model: {data}")
+        return str(provider), str(mid)
+
     def create_session(self, title: str, model: str = "", agent: str = "",
-                       directory: str = "") -> str:
+                       directory: str = "", variant: str = "") -> str:
         body: dict = {"title": title}
+        provider = mid = ""
         if model:
             provider, mid = split_model(model)
-            body["model"] = {"providerID": provider, "id": mid}
+        elif variant:
+            # a variant needs an explicit model ref: pin the server default
+            provider, mid = self.default_model(directory)
+        if provider:
+            ref: dict = {"providerID": provider, "id": mid}
+            if variant:
+                ref["variant"] = variant
+            body["model"] = ref
         if agent:
             body["agent"] = agent
         if directory:
@@ -126,6 +147,15 @@ class OpenCodeClient:
     def send_prompt(self, session_id: str, text: str) -> None:
         self._req("POST", f"/api/session/{session_id}/prompt", {"text": text})
 
+    def steer(self, session_id: str, text: str) -> None:
+        """Interject into a running turn (inbox ``steer`` delivery).
+
+        Raises ``OpenCodeError`` if the session is gone / not running —
+        unlike ``interrupt`` this caller needs to know whether it landed.
+        """
+        self._req("POST", f"/api/session/{session_id}/prompt",
+                  {"text": text, "delivery": "steer"})
+
     def interrupt(self, session_id: str) -> None:
         """Best-effort: a session that already finished answers 404/no-op."""
         try:
@@ -142,20 +172,23 @@ class OpenCodeClient:
     # -- the orchestrated run -----------------------------------------------------
 
     def run(self, *, title: str, prompt: str, system: str = "", model: str = "",
-            agent: str = "", directory: str = "", timeout: float = 300.0,
-            cancel=None, keep_session: bool = False, on_session=None,
-            log=None) -> ActionResult:
+            agent: str = "", directory: str = "", variant: str = "",
+            timeout: float = 300.0, cancel=None, keep_session: bool = False,
+            on_session=None, log=None) -> ActionResult:
         """Create a fresh session, prompt it, wait for the answer.
 
-        ``cancel`` is polled between requests — when it turns True the run is
-        interrupted (the room's ``stop``). ``on_session`` receives the session
-        id as soon as it exists, so a stop can interrupt it even before the
-        first poll.
+        ``variant`` is the model's reasoning-effort variant (the room's
+        ``/effort``); empty = the model's default. ``cancel`` is polled
+        between requests — when it turns True the run is interrupted (the
+        room's ``stop``). ``on_session`` receives the session id as soon as
+        it exists, so a stop can interrupt it even before the first poll
+        and a ``/btw`` can steer it while it runs.
         """
         log = log or (lambda m: print(m, file=sys.stderr, flush=True))
         result = ActionResult()
         try:
-            result.session_id = self.create_session(title, model, agent, directory)
+            result.session_id = self.create_session(title, model, agent,
+                                                    directory, variant)
             if on_session:
                 on_session(result.session_id)
             if system:

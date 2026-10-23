@@ -252,6 +252,36 @@ whole rule: a sentence that merely starts with "stop" such as
 > message), stopping is an API interrupt — the old `opencode run
 > --standalone` process-group caveat is gone.
 
+### Reasoning effort (`/effort`)
+
+`/effort` in a room lists the effort levels (and what the room currently
+uses); `/effort <level>` sets one **for that room** — the leading `/` is
+required, the whole message must be the command:
+
+| level | OpenCode model variant |
+|-----------|------------------------|
+| `default` | the model's own default (resets the override) |
+| `low` | `low` |
+| `mid` | `medium` |
+| `high` | `high` |
+| `xhigh` | `xhigh` |
+
+The setting is remembered per room (in the bot's state dir, so it survives
+restarts) and becomes the model `variant` of every action run started in
+that room afterwards — trigger runs and voice-call actions alike. If the
+action pins no `model`, the server's default model for the session's
+directory is resolved (`GET /api/model/default`) so the variant can still
+be applied.
+
+### Interjections (`/btw`)
+
+`/btw <text>` is a Zwischenruf for the action(s) **currently running** in
+the room: instead of starting a new run (or feeding a `wait_for_reply`
+client), the text is admitted to the running OpenCode session as a `steer`
+prompt, so the model sees it mid-turn. If nothing is running the bot says
+so; the message gets the usual 🔧 while it is being handed over. (Unlike a
+plain "btw …" in chat, which stays a normal message, the `/` is required.)
+
 ## Voice calls (MatrixRTC / Element Call)
 
 A bot can answer the calls your Matrix client places in a room: it joins the
