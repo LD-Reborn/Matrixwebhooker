@@ -470,7 +470,16 @@ Desktop & friends):
 
 ## Notes & limitations
 
-- Plaintext rooms only — no end-to-end encryption.
+- **The room has to be unencrypted for a bot to read it.** Decryption itself
+  is implemented (`crypto.py`: Olm sessions, Megolm import, room-key
+  requests) — but a key request is only answered by a client that *trusts*
+  the bot's device, and Element does not share room keys with unverified
+  devices at all. An encrypted room therefore stays unreadable: the watcher
+  logs `no megolm session … (room key never shared yet)`, sends key
+  requests and gives up — no trigger ever fires. **Element encrypts group
+  DMs automatically**, so invite the bot into a *normal* room instead (let
+  the bot create it: then it holds the power levels and encryption stays
+  off, which also keeps the room fixable later).
 - If a bot isn't in the room but has a pending invitation, it auto-joins.
 - Access tokens are cached per bot (state volume/file); on a 401 the bot
   re-logs in and retries once.
