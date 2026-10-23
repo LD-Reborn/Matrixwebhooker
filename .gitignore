@@ -7,6 +7,9 @@ local_secrets.json
 */.token
 */.room_id
 */crypto/
+*/key_pending.json
+*/effort.json
+*/voice-cache/
 .trigger-context/
 __pycache__/
 *.pyc
@@ -23,3 +26,4 @@ _live_e2e_test.py
 _refresh_otks.py
 _reregister.py
 recovery_bot.py
+bench/
