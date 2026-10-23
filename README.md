@@ -1,12 +1,21 @@
 # MatrixWebhooker
 
-A tiny webhook → Matrix bridge with support for **multiple bot accounts**.
-Send an alert to `POST /webhook`, and it shows up in a Matrix room as a
-message from the bot identified by the API key you used:
+A self-hosted **Matrix bot gateway** with support for **multiple bot accounts**:
+
+- **Webhook → Matrix** — send an alert to `POST /webhook` and it shows up in a
+  Matrix room as a message from the bot identified by the API key you used.
+- **Triggers (Matrix → OpenCode)** — incoming room messages fire configurable
+  actions on an OpenCode server; the answer is posted back to the room.
+- **Voice calls** — answers MatrixRTC (Element Call) calls with whisper + TTS.
+- **E2EE** — decrypts room messages (libolm), including stuck-key recovery.
+- **MCP server** — exposes Matrix tools (`send_message`, `wait_for_reply`,
+  `read_messages`, `react`) to OpenCode agents.
 
 ```
 Grafana, CI, ... ──HTTP──▶ MatrixWebhooker ──Matrix API──▶ per-bot Matrix room
-                              (one entry per bot)
+                               │    ▲                     (one entry per bot)
+                               ▼    └── messages, calls
+                         OpenCode server (AI actions)
 ```
 
 ## Setup
