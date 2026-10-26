@@ -828,6 +828,23 @@ class Matrix:
                     continue
                 raise
 
+    def send_event(self, room_id: str, event_type: str, content: dict) -> dict:
+        """Send a room event of an arbitrary type (e.g. the MSC4075
+        ``org.matrix.msc4075.rtc.notification`` that makes clients ring)."""
+        txn = f"whk-{secrets.token_hex(8)}"
+        url = (f"{self.hs}/_matrix/client/v3/rooms/{quote(room_id, safe='')}/send/"
+               f"{quote(event_type, safe='')}/{txn}")
+        for attempt in (1, 2):
+            try:
+                return self._request("PUT", url, content)
+            except MatrixError as exc:
+                if (exc.status == 403 and attempt != 2
+                        and "not in the room" in str(exc.payload).lower()):
+                    self.join(room_id)
+                    continue
+                raise
+        return {}
+
     def react(self, room_id: str, target_event_id: str, key: str) -> str | None:
         """Add an emoji reaction (``m.annotation`` relation) to ``target_event_id``.
 

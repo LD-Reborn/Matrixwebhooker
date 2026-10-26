@@ -75,7 +75,8 @@ def slot_id_of(template: dict) -> str:
         return content["slot_id"]
     application = content.get("application")
     app = application if isinstance(application, str) else "m.call"
-    return f"{app}#{content.get('call_id', 'ROOM')}"
+    # legacy sessions with an empty call id sit in the slot "m.call#ROOM"
+    return f"{app}#{content.get('call_id') or 'ROOM'}"
 
 
 def is_sticky(content: dict) -> bool:
@@ -337,6 +338,7 @@ class CallSession:
         _log(f"{self.tag} joined {self.template_type} slot {slot} as {self.member_id} "
              f"(state key {key!r}) via {sfu_url}")
         if self.outgoing:
+            self._ensure_slot_open()
             self._send_call_notify((resp or {}).get("event_id") or "")
             self._post_call_message()
 
@@ -386,6 +388,8 @@ class CallSession:
                     self.bot.client.send_state(self.room_id, self.template_type, key, leave)
                 except MatrixError as exc:
                     _log(f"{self.tag} withdrawing membership failed: {exc}")
+                if self.outgoing:
+                    self._close_slot_if_alone()
             try:
                 await room.disconnect()
             except Exception:  # noqa: BLE001
@@ -400,13 +404,16 @@ class CallSession:
                     _log(f"{self.tag} posting the no-answer note failed: {exc}")
 
     def _send_call_notify(self, event_id: str) -> None:
-        """MSC4184: tell the invitees' clients to ring for this call.
+        """Ring the invitees.
 
-        Sent twice per user (unstable + final event type) — clients picked up
-        one or the other depending on their vintage; the stranger is ignored.
-        The focus entries must carry the ``type: livekit`` discriminant:
-        rust-sdk based clients (Element X) fail to parse the notification
-        without it and silently drop it.
+        Current clients (Element X included) follow MSC4075: a room event
+        ``org.matrix.msc4075.rtc.notification`` mentioning the room — the
+        receiver only accepts it when the slot state exists as ``open``
+        (see ``_ensure_slot_open``), it mentions them, and its lifetime
+        (max 2 minutes) has not elapsed. Older clients understood the
+        MSC4184 ``m.call.notify`` to-device event instead (focus entries
+        need the ``type: livekit`` discriminant there, or rust-sdk clients
+        silently drop it); both are sent, the stranger is ignored.
         """
         if not event_id:
             _log(f"{self.tag} membership event has no id — cannot ring anyone")
@@ -414,6 +421,21 @@ class CallSession:
         if not self.invite:
             _log(f"{self.tag} nobody else in the room to ring")
             return
+        slot = slot_id_of(self.template)
+        try:
+            self.bot.client.send_event(self.room_id, "org.matrix.msc4075.rtc.notification", {
+                "slot_id": slot,
+                "m.mentions": {"user_ids": [], "room": True},
+                "m.relates_to": {"rel_type": "m.reference", "event_id": event_id},
+                "sender_ts": int(time.time() * 1000),
+                "lifetime": min(self.ring_seconds, 120) * 1000,
+                "msc4354_sticky_key": slot,
+                # deprecated fields current senders still include for old receivers:
+                "notification_type": "ring",
+                "m.call.intent": "audio",
+            })
+        except MatrixError as exc:
+            _log(f"{self.tag} msc4075 room notification failed: {exc}")
         call_id = str((self.template.get("content") or {}).get("call_id", ""))
         foci = [{"type": "livekit", **{k: v for k, v in f.items() if k != "type"}}
                 for f in self.foci]
@@ -431,7 +453,31 @@ class CallSession:
                     self.bot.client.send_to_device(etype, {user: {"*": content}})
                 except MatrixError as exc:
                     _log(f"{self.tag} {etype} to {user} failed: {exc}")
-            _log(f"{self.tag} rang {user} ({len(self.invite)} invitee(s))")
+            _log(f"{self.tag} rang {user} (room notification + to-device)")
+
+    def _ensure_slot_open(self) -> None:
+        """The MSC4143 slot state has to read 'open' or receivers reject the
+        notification ("slot does not exist or is closed")."""
+        slot = slot_id_of(self.template)
+        try:
+            self.bot.client.send_state(self.room_id, "org.matrix.msc4143.rtc.slot",
+                                       slot, {"status": "open",
+                                              "application": {"type": "m.call"}})
+        except MatrixError as exc:
+            _log(f"{self.tag} opening call slot {slot!r} failed: {exc}")
+
+    def _close_slot_if_alone(self) -> None:
+        """Outgoing call over and nobody else is in the slot: close it again
+        (leave the slot alone if the callee stayed on the call)."""
+        if self.mgr._members.get(self.room_id):
+            return
+        slot = slot_id_of(self.template)
+        try:
+            self.bot.client.send_state(self.room_id, "org.matrix.msc4143.rtc.slot",
+                                       slot, {"status": "closed",
+                                              "application": {"type": "m.call"}})
+        except MatrixError as exc:
+            _log(f"{self.tag} closing call slot {slot!r} failed: {exc}")
 
     def _post_call_message(self) -> None:
         """Visible timeline fallback for the outgoing call: clients that do

@@ -147,12 +147,17 @@ def main() -> int:
         print(f"place_call failed: {err}", file=sys.stderr)
         return 1
 
-    # the membership we published must be visible in the room state
+    # the membership we published must be visible in the room state, and per
+    # MSC4075 the slot state must read "open" or receivers reject the notify
     time.sleep(3)
     mine = [ev for ev in bot.client.room_state(room_id, CALL_STATE_TYPES)
             if (ev.get("content") or {}).get("membershipID")]
     print(f"state: {len(mine)} live call membership(s) "
           f"{[ev.get('state_key') for ev in mine]}")
+    slots = [ev for ev in bot.client.room_state(room_id, ("org.matrix.msc4143.rtc.slot",))
+             if (ev.get("content") or {}).get("status") == "open"]
+    print(f"state: {len(slots)} open slot(s) {[ev.get('state_key') for ev in slots]}"
+          + ("" if slots else "  <-- MSC4075 clients will NOT ring"))
 
     ok = False
     try:
