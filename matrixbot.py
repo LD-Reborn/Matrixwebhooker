@@ -161,6 +161,10 @@ class CallConfig:
     max_utterance: float = 20.0     # seconds before an utterance is cut off
     # outgoing calls (POST /call, MCP place_call)
     ring_seconds: int = 30          # how long the callee has to pick up
+    ring_slot: bool = True          # publish the MSC4143 slot state event
+                                    # (current receivers demand it; clients
+                                    # too old for it show it as a "Custom
+                                    # event" tile — set false for those)
     no_answer_message: str = ""     # posted to the room when nobody picks up
                                     # (empty = post nothing)
     call_message: str = ""          # posted when the bot calls out, so the
@@ -234,6 +238,7 @@ def call_config_from(entry: dict, path: Path, templates: dict) -> CallConfig:
         min_speech=min_speech,
         max_utterance=max_utterance,
         ring_seconds=ring_seconds,
+        ring_slot=bool(raw.get("ring_slot", True)),
         no_answer_message=str(raw.get("no_answer_message") or ""),
         call_message=str(raw.get("call_message") or ""),
     )

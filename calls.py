@@ -126,7 +126,8 @@ def own_membership(template: dict, *, user_id: str, device_id: str, member_id: s
         if sfu_url:
             content["foci_preferred"] = [{"type": "livekit", "url": sfu_url}]
         elif service_url:
-            content["foci_preferred"] = [{"livekit_service_url": service_url}]
+            content["foci_preferred"] = [{"type": "livekit",
+                                          "livekit_service_url": service_url}]
 
     key = str(template.get("state_key") or "")
     if not key or key == sender:
@@ -153,22 +154,25 @@ def left_membership(template: dict, *, user_id: str, device_id: str,
     return key, {}
 
 
-def outgoing_template(client) -> tuple[dict, list[dict]]:
+def outgoing_template(client, room_id: str) -> tuple[dict, list[dict]]:
     """The membership event we publish when *we* place a call.
 
-    Shaped like the sessions current Element clients create themselves
-    (MSC3401 legacy: state key ``_<user>_<device>_m.call``, empty
-    ``call_id``, ``membershipID`` = ``userId:deviceId``) — that is exactly
-    the shape whose SFU slot (the JWT service's default, ``m.call#ROOM``)
-    calls in these rooms land in today, so a picking-up client meets us in
-    the same LiveKit room.  Returns ``(template, foci_preferred)``.
+    Shaped exactly like the sessions Element X creates itself (MSC3401
+    legacy: state key ``_<user>_<device>_m.call``, empty ``call_id``,
+    ``membershipID`` = ``userId:deviceId`` and foci entries carrying the
+    ``type: livekit`` discriminant plus ``livekit_alias`` = room id) —
+    rust-sdk clients parse the membership through a ``type``-tagged enum
+    and ignore entries without it, which also makes them ignore the call
+    notification that references such a membership.  Returns
+    ``(template, foci_preferred)``.
     """
     user_id = client.user_id
     device_id = client.device_id or ""
     transports = client.rtc_transports()
     service_url = next((t.get("livekit_service_url") for t in transports
                         if t.get("livekit_service_url")), "")
-    foci = ([{"livekit_service_url": service_url}] if service_url
+    foci = ([{"livekit_alias": room_id, "livekit_service_url": service_url,
+              "type": "livekit"}] if service_url
             else [{"type": "livekit", "url": t["url"]}
                   for t in transports if t.get("url")])
     content = {
@@ -421,16 +425,16 @@ class CallSession:
         if not self.invite:
             _log(f"{self.tag} nobody else in the room to ring")
             return
-        slot = slot_id_of(self.template)
         try:
+            # byte-for-byte the shape Element X itself sends when *it* calls:
+            # no slot_id/sticky key (older MSC4075 revisions ignore them and
+            # current receivers fill slot_id from the referenced membership),
+            # 30 s lifetime, notification_type + intent for legacy readers.
             self.bot.client.send_event(self.room_id, "org.matrix.msc4075.rtc.notification", {
-                "slot_id": slot,
                 "m.mentions": {"user_ids": [], "room": True},
                 "m.relates_to": {"rel_type": "m.reference", "event_id": event_id},
                 "sender_ts": int(time.time() * 1000),
-                "lifetime": min(self.ring_seconds, 120) * 1000,
-                "msc4354_sticky_key": slot,
-                # deprecated fields current senders still include for old receivers:
+                "lifetime": 30_000,
                 "notification_type": "ring",
                 "m.call.intent": "audio",
             })
@@ -456,8 +460,12 @@ class CallSession:
             _log(f"{self.tag} rang {user} (room notification + to-device)")
 
     def _ensure_slot_open(self) -> None:
-        """The MSC4143 slot state has to read 'open' or receivers reject the
-        notification ("slot does not exist or is closed")."""
+        """The MSC4143 slot state has to read 'open' or current receivers
+        reject the notification ("slot does not exist or is closed").
+        ``call.ring_slot`` is false for clients that predate slot events —
+        they only show the state event as a "Custom event" tile."""
+        if not self.cfg.ring_slot:
+            return
         slot = slot_id_of(self.template)
         try:
             self.bot.client.send_state(self.room_id, "org.matrix.msc4143.rtc.slot",
@@ -469,6 +477,8 @@ class CallSession:
     def _close_slot_if_alone(self) -> None:
         """Outgoing call over and nobody else is in the slot: close it again
         (leave the slot alone if the callee stayed on the call)."""
+        if not self.cfg.ring_slot:
+            return
         if self.mgr._members.get(self.room_id):
             return
         slot = slot_id_of(self.template)
@@ -937,7 +947,7 @@ class CallManager:
             except MatrixError as exc:
                 return f"cannot read the room's members: {exc}"
         targets = [m for m in (invite or members) if m != self.bot.user_id]
-        template, foci = outgoing_template(self.bot.client)
+        template, foci = outgoing_template(self.bot.client, room_id)
         session = CallSession(self, room_id, room_name, template, outgoing=True,
                               note=note, invite=targets, foci=foci,
                               ring_seconds=ring_seconds)

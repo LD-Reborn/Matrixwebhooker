@@ -404,19 +404,30 @@ The same `call` config also lets a bot **place** the call:
   trigger action's agent (or a Grafana alert behind it) can dial you.
 
 What happens: the bot publishes its *own* call membership (legacy MSC3401
-session shape — empty `call_id`, which is the SFU slot current clients use),
-joins the SFU, and sends every invitee an MSC4184 `m.call.notify`
-to-device event (both event types; the focus entries need the
-`"type": "livekit"` discriminant — rust-sdk clients silently drop the
-notification without it). Your Element/Element X shows an incoming call;
-once you pick up the bot speaks the `note` (else the `greeting`) and the
-normal listen/answer pipeline takes over. If nobody picks up within
-`ring_seconds` the bot hangs up and posts `no_answer_message` to the room
-(both are bots.json `call` keys). `call_message` additionally posts a
-visible timeline note with a **call link** when the bot calls out — the
-reliable fallback: to-device ringing only reaches *running* clients, there
-is no push for closed apps yet (that is Sygnal territory / MSC4184 push,
-not in Synapse 1.163). `GET /health` marks sessions `outgoing`/`answered`.
+session shape — empty `call_id`, which is the SFU slot current clients use)
+**in exactly the shape Element X creates for its own calls**: the
+`foci_preferred` entries must carry the `"type": "livekit"` discriminant
+and `livekit_alias` — rust-sdk parses focuses through a `type`-tagged enum
+and silently ignores entries (and therefore the whole membership, and the
+notification that references it) without it. Then it sends a
+`org.matrix.msc4075.rtc.notification` **room event** (MSC4075: mentions the
+room, `m.reference` to the membership event, 30 s lifetime — deliberately
+without `slot_id`/sticky key, matching what Element X itself sends), plus
+the older MSC4184 `m.call.notify` to-device event (focus entries need the
+`"type": "livekit"` discriminant there too). Your Element/Element X shows
+an incoming call; once you pick up the bot speaks the `note` (else the
+`greeting`) and the normal listen/answer pipeline takes over. If nobody
+picks up within `ring_seconds` the bot hangs up and posts
+`no_answer_message` to the room (both are bots.json `call` keys).
+`call_message` additionally posts a visible timeline note with a **call
+link** when the bot calls out — the reliable fallback: to-device ringing
+only reaches *running* clients, there is no push for closed apps yet (that
+is Sygnal territory / MSC4184 push, not in Synapse 1.163). Clients that
+predate MSC4143 *slot* events show the slot state event as a "Custom
+event" tile and never consult it — set `call.ring_slot` to `false` to stop
+publishing it (current receivers demand an open slot, so leave it `true`
+once your clients are up to date). `GET /health` marks sessions
+`outgoing`/`answered`.
 
     curl -X POST http://localhost:8080/call -H "X-API-Key: $BOT_KEY" \
       -H "Content-Type: application/json" \
