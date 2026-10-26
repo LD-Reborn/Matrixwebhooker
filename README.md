@@ -6,7 +6,8 @@ A self-hosted **Matrix bot gateway** with support for **multiple bot accounts**:
   Matrix room as a message from the bot identified by the API key you used.
 - **Triggers (Matrix → OpenCode)** — incoming room messages fire configurable
   actions on an OpenCode server; the answer is posted back to the room.
-- **Voice calls** — answers MatrixRTC (Element Call) calls with whisper + TTS.
+- **Voice calls** — answers MatrixRTC (Element Call) calls with whisper + TTS,
+  and can place them too (`POST /call`, MCP `place_call`).
 - **E2EE** — decrypts room messages (libolm), including stuck-key recovery.
 - **MCP server** — exposes Matrix tools (`send_message`, `wait_for_reply`,
   `read_messages`, `react`) to OpenCode agents.
@@ -393,6 +394,41 @@ How it behaves:
   calls work in rooms **without** end-to-end encryption (which is also what
   the rest of this bridge assumes).
 
+## Outgoing calls (the bot calls *you*)
+
+The same `call` config also lets a bot **place** the call:
+
+- **HTTP** `POST /call` with the bot's API key — body:
+  `{"room_id": "!…"(optional, default the bot's room), "note": "text spoken when picked up", "ring_seconds": 5..300, "invite": ["@user:domain", …] (default: every other room member)}`
+- **MCP tool** `place_call(room="", bot="", note="", ring_seconds=30)` — so a
+  trigger action's agent (or a Grafana alert behind it) can dial you.
+
+What happens: the bot publishes its *own* call membership (legacy MSC3401
+session shape — empty `call_id`, which is the SFU slot current clients use),
+joins the SFU, and sends every invitee an MSC4184 `m.call.notify`
+to-device event (both event types; the focus entries need the
+`"type": "livekit"` discriminant — rust-sdk clients silently drop the
+notification without it). Your Element/Element X shows an incoming call;
+once you pick up the bot speaks the `note` (else the `greeting`) and the
+normal listen/answer pipeline takes over. If nobody picks up within
+`ring_seconds` the bot hangs up and posts `no_answer_message` to the room
+(both are bots.json `call` keys). `call_message` additionally posts a
+visible timeline note with a **call link** when the bot calls out — the
+reliable fallback: to-device ringing only reaches *running* clients, there
+is no push for closed apps yet (that is Sygnal territory / MSC4184 push,
+not in Synapse 1.163). `GET /health` marks sessions `outgoing`/`answered`.
+
+    curl -X POST http://localhost:8080/call -H "X-API-Key: $BOT_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{"note": "Deploy ist durch.", "ring_seconds": 60}'
+
+`python3 _call_out_test.py` runs both sides without Element: the script
+joins the SFU as a fake callee (with its **own** LiveKit identity — the
+legacy `/sfu/get` token carries `userId:deviceId`, and LiveKit makes two
+same-identity participants invisible to each other, which is why this
+matters in scripts, never with real clients), records what the bot
+speaks, asks a question and transcribes the answer.
+
 ## API
 
 Auth header for every request: `X-API-Key: <api_key of the bot>` (or
@@ -442,9 +478,9 @@ Service status plus per-bot state (`connected`, `room`).
 
 ## MCP server (optional)
 
-The same bot model is exposed as an MCP server (`mcp_server.py`) with six
+The same bot model is exposed as an MCP server (`mcp_server.py`) with seven
 tools — `list_bots`, `list_rooms`, `read_messages`, `send_message`, `react`,
-`wait_for_reply` — so an
+`wait_for_reply`, `place_call` — so an
 AI assistant can read from and send to your Matrix rooms. `react(event_id,
 key, room)` adds an emoji reaction to a specific message (e.g. `key="✅"`),
 using the `event_id` returned by `read_messages`. It talks to the

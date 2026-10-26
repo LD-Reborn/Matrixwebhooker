@@ -54,7 +54,10 @@
         "echo_factor": 2.5,
         "barge_in": 0.4,
         "silence_end": 0.9,
-        "max_answer_chars": 220
+        "max_answer_chars": 220,
+        "ring_seconds": 30,
+        "call_message": "📞 Der Bot ruft dich an – in diesem Raum beitreten, oder: {{link}}",
+        "no_answer_message": "📞 Ich habe angerufen – niemand ging ran."
       }
     }
   ]
