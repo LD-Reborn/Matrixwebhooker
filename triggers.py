@@ -74,6 +74,14 @@ MAX_WAIT_SECONDS = 600
 #: removes again as soon as handling of that message is over.
 WRENCH_REACTION = "🔧"
 
+#: When the watcher sees a room for the first time mid-run, the bot has just
+#: joined it and /sync delivers part of that room's recent history along
+#: with the actually new messages.  Events older than this grace window in
+#: such a room are backlog: acting on them would fire triggers (or stop
+#: commands) on week-old text.  Fresher ones are treated as real messages,
+#: so "invite the bot, say hi" still works immediately.
+BACKLOG_GRACE_SECONDS = 120
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -273,6 +281,11 @@ class MessageWatcher:
         # unchanged state, so names learned from the initial snapshot (or
         # the state API) are kept here for trigger matching.
         self._room_names: dict[str, str] = {}
+        # Rooms this watcher has already seen events from.  A room that shows
+        # up for the first time mid-session was joined after startup: /sync
+        # then delivers its history as if it were news, so clearly-old events
+        # in it are backlog and must not fire triggers or stop commands.
+        self._known_rooms: set[str] = set()
         # In-flight runs (casefolded room_id -> active sessions).  Guarded by
         # _session_lock; shared with the stop path and the wrench bookkeeping.
         self._session_lock = threading.Lock()
@@ -478,6 +491,8 @@ class MessageWatcher:
         if was_first:
             # Snapshot: learn room names, but never act on history.
             for ev in result["events"]:
+                if ev.get("room_id"):
+                    self._known_rooms.add(ev["room_id"])
                 if ev.get("room_name"):
                     self._room_names[ev["room_id"]] = ev["room_name"]
             # Key material delivered in the snapshot can still be useful
@@ -497,15 +512,49 @@ class MessageWatcher:
             self._ingest_todevice(to_device)
         for ev in result.get("state") or []:
             self._on_state(ev)
+        events = self._drop_backlog(result.get("events") or [])
         # The key failed events were waiting for may have just arrived —
         # retry them before processing the fresh timeline events.
-        events = self._retry_pending_keys() + self._decrypt_events(
-            result.get("events") or [])
+        events = self._retry_pending_keys() + self._decrypt_events(events)
         if not events:
             return
         _log(f"{self.tag} +{len(events)} message(s)")
         for ev in events:
             self._handle(ev)
+
+    def _drop_backlog(self, events: list[dict]) -> list[dict]:
+        """Drop the history /sync hands over when the bot joined a room
+        mid-session (that room's first non-snapshot events).
+
+        Events older than ``BACKLOG_GRACE_SECONDS`` in a room this watcher
+        has not seen yet are backlog and would fire triggers (or "stop") on
+        long-answered text; each room is judged exactly once, on the batch
+        it first appears in.  The check runs on the raw timeline events, so
+        undecryptable backlog events are dropped before they are queued for
+        a key retry.
+        """
+        fresh: list[dict] = []
+        stale: dict[str, int] = {}
+        newly_seen: set[str] = set()
+        now_ms = time.time() * 1000
+        for ev in events:
+            rid = ev.get("room_id") or ""
+            if rid in self._known_rooms:
+                fresh.append(ev)
+                continue
+            ts = ev.get("ts") or 0
+            # first time we see this room at all: judge its whole batch once
+            newly_seen.add(rid)
+            if ts and now_ms - ts > BACKLOG_GRACE_SECONDS * 1000:
+                stale[rid] = stale.get(rid, 0) + 1
+            else:
+                fresh.append(ev)
+        self._known_rooms |= newly_seen
+        for rid, count in stale.items():
+            _log(f"{self.tag} {rid}: skipped {count} backlog message(s) "
+                 f"from a room joined mid-run "
+                 f"(older than {BACKLOG_GRACE_SECONDS}s)")
+        return fresh
 
     def _on_state(self, ev: dict) -> None:
         """Room state changes: hand call membership events to the CallManager."""
