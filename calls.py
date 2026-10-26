@@ -274,6 +274,7 @@ class CallSession:
         self._interrupted = False       # the caller cut us off
         self._skip_leave = False        # replaced by a newer session
         self._timed_out = False         # the answer action ran past its timeout
+        self._failed = False            # the answer action failed outright
         self._source = None
         self._thread: threading.Thread | None = None
         self.tag = f"[call:{self.bot.name}:{room_id[:14]}]"
@@ -684,6 +685,8 @@ class CallSession:
         elif self._timed_out and self.cfg.sorry_line:
             # silence is worse than an apology: the caller is still holding
             await self._speak(self.cfg.sorry_line, cached=True, t0=t_start)
+        elif self._failed and self.cfg.error_line:
+            await self._speak(self.cfg.error_line, cached=True, t0=t_start)
         if self.cfg.log_transcripts:
             await loop.run_in_executor(None, self._log_to_room, text, answer)
 
@@ -767,6 +770,7 @@ class CallSession:
             "transcript": transcript,
         }
         self._timed_out = False
+        self._failed = False
         result = self.bot.opencode.run(
             title=f"MatrixWebhooker call {self.bot.name} {self.room_name or self.room_id}",
             prompt=render_text(action.prompt, values),
@@ -781,6 +785,7 @@ class CallSession:
         elif result.outcome == "succeeded":
             return result.text
         elif result.outcome != "interrupted":
+            self._failed = True
             _log(f"{self.tag} action failed: {result.error} "
                  f"(session {result.session_id} kept)")
         return ""
@@ -821,7 +826,7 @@ class CallManager:
         if self.speech is None:
             return
         phrases = [p for p in (self.cfg.greeting, self.cfg.thinking_cue,
-                               self.cfg.sorry_line) if p]
+                               self.cfg.sorry_line, self.cfg.error_line) if p]
 
         def _warm() -> None:
             for phrase in phrases:

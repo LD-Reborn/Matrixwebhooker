@@ -153,6 +153,7 @@ class CallConfig:
     max_answer_chars: int = 220   # spoken answers are clipped to this (tts is
                                   # ~3.5x the length of what it speaks)
     sorry_line: str = "Das hat zu lange gedauert, frag bitte nochmal."
+    error_line: str = "Da ist gerade etwas schiefgegangen, frag bitte nochmal."
     vad_threshold: int = 400        # rms of 16-bit pcm that counts as speech
     echo_factor: float = 2.5        # while we speak, input must be this louder
     barge_in: float = 0.4           # seconds of that before we stop talking
@@ -231,6 +232,9 @@ def call_config_from(entry: dict, path: Path, templates: dict) -> CallConfig:
         max_answer_chars=max_answer_chars,
         sorry_line=str(raw.get("sorry_line",
                                "Das hat zu lange gedauert, frag bitte nochmal.")),
+        error_line=str(raw.get("error_line",
+                               "Da ist gerade etwas schiefgegangen, "
+                               "frag bitte nochmal.")),
         vad_threshold=vad,
         echo_factor=echo_factor,
         barge_in=barge_in,

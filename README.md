@@ -244,6 +244,21 @@ action(s) finish, the run is stopped, or the room's pending wait is
 released — so in the room you can always tell which messages the bot is
 still working on.
 
+A run that ends **without an answer** never leaves the room silent (unless
+you stopped it): the bot posts a short notice instead —
+
+- `⚠️ The action failed after …` — with the OpenCode server's error message
+  (HTTP status, model/context complaints, …) and the session id kept for
+  inspection;
+- `⏳ The action timed out after …` — the run exceeded `action.timeout`;
+- `🤔 The action ran to its end, but the model produced no text.`
+
+Full details always go to the service log (`journalctl -u matrix-webhooker`).
+In voice calls the same rule holds: when the answer action fails, the
+caller hears `call.error_line` (default *"Da ist gerade etwas
+schiefgegangen, frag bitte nochmal."*) instead of silence — `sorry_line`
+already covers timeouts.
+
 ### Stopping a run
 
 To interrupt the current execution in a room, just send a bare **`stop`**

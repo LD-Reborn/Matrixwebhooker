@@ -41,6 +41,13 @@ Wrench feedback (🔧):
     the reaction is removed again (the reaction event is redacted), so you
     can tell at a glance which messages the bot is still working on.
 
+Failure feedback:
+    A run that ends without an answer never goes silent: unless a stop
+    command cancelled it, the room gets a short notice — ``⚠️`` with the
+    server's error (and the kept OpenCode session id) when the action
+    failed, ``⏳`` on ``action.timeout``, ``🤔`` when the model finished
+    without producing any text.  The full details always go to the log.
+
 ``mcp_server.py`` deliberately runs no watcher of its own: its
 ``wait_for_reply`` tool talks to this server, so waits and trigger
 suppression always live in exactly one process (no double-firing).
@@ -603,12 +610,13 @@ class MessageWatcher:
                 _log(f"{self.tag} interrupting {sid} failed: {exc}")
 
     def _send_note(self, room_id: str, message: str) -> None:
-        """Post a short command-acknowledgment text into the room."""
+        """Post a short status text into the room (command acks, action
+        failures — the things that must never pass silently)."""
         try:
             self.bot.client.send_message(room_id,
                                          {"msgtype": "m.text", "body": message})
         except MatrixError as exc:
-            _log(f"{self.tag} sending the command reply failed: {exc}")
+            _log(f"{self.tag} sending the room notice failed: {exc}")
 
     def _stop_room(self, room_id: str, where: str) -> None:
         """Handle a bare "stop" in ``room_id``: interrupt the run, release
@@ -837,12 +845,28 @@ class MessageWatcher:
                     _log(f"{tag} posting the answer failed: {exc}")
             elif not result.text:
                 _log(f"{tag} the model produced no text — nothing to post")
+                if not sess.cancelled:
+                    self._send_note(room_id, "🤔 The action ran to its end, "
+                                             "but the model produced no text.")
         elif result.outcome == "timeout":
             _log(f"{tag} no answer after {dt:.1f}s (action.timeout)")
+            if not sess.cancelled:
+                self._send_note(room_id, f"⏳ The action timed out after "
+                                         f"{dt:.0f}s (action.timeout is "
+                                         f"{action.timeout}s) — no answer.")
         elif result.outcome == "interrupted":
             _log(f"{tag} interrupted after {dt:.1f}s")
         else:
             _log(f"{tag} action failed after {dt:.1f}s: {result.error} "
                  f"(session {result.session_id} kept for inspection)")
+            if not sess.cancelled:
+                why = " ".join(str(result.error or "no error detail").split())
+                if len(why) > 300:
+                    why = why[:300] + "…"
+                note = f"⚠️ The action failed after {dt:.1f}s: {why}"
+                if result.session_id:
+                    note += (f" (OpenCode session {result.session_id} "
+                             "kept for inspection)")
+                self._send_note(room_id, note)
         if sess.cancelled:
             _log(f"{tag} stopped by user command")
