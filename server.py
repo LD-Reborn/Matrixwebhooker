@@ -12,6 +12,10 @@ Endpoints:
                 "room_id": "optional override of the bot's default room"}
     POST /wait       block for the bot's next message in a room; that message
                      skips the bot's triggers (body: {"room_id": "!...", "timeout": 120})
+    POST /call       place an outgoing MatrixRTC voice call in a room the bot
+                     is in (body: {"room_id": "optional !...", "note": "optional text
+                     spoken when picked up", "ring_seconds": optional,
+                     "invite": optional list of user ids})
     GET  /me         which bot this API key belongs to (+ its triggers)
     GET  /rooms      the requesting bot's joined rooms (id + name)
     GET  /rooms/<room_id>/messages
@@ -128,6 +132,17 @@ def index():
             "GET /me": "which bot an API key belongs to (with its triggers)",
             "GET /rooms": "the requesting bot's joined rooms",
             "GET /rooms/<room_id>/messages": "recent messages (?limit=50, max 100)",
+            "POST /call": {
+                "auth": "same API key (names the bot that calls)",
+                "body": {"room_id": "optional !... (default: the bot's room)",
+                         "note": "optional text the bot speaks when picked up",
+                         "ring_seconds": "optional, 5..300 (bots.json call.ring_seconds)",
+                         "invite": "optional [\"@user:domain\", ...] (default: every "
+                                   "other member of the room)"},
+                "note": "publishes the bot's MatrixRTC membership, sends an MSC4184 "
+                        "m.call.notify so Element clients ring, and answers the call "
+                        "once picked up (voice settings from bots.json \"call\")",
+            },
             "GET /health": "service + per-bot status, no auth",
         },
         "matrix": settings.homeserver,
@@ -248,6 +263,59 @@ def wait_reply():
                         "received": waiter.message, "stopped": waiter.stopped})
     return jsonify({"ok": True, "bot": bot.name, "room": room_id,
                     "received": None, "stopped": False})
+
+
+@app.post("/call")
+def call_out():
+    """Place an outgoing MatrixRTC voice call as the requesting bot.
+
+    Requires the bot's ``"call"`` config (bots.json) — the call is answered
+    with the same speech pipeline as incoming ones.
+    """
+    bot = _authed_bot()
+    if bot is None:
+        return (jsonify({"error": "unauthorized: send a valid bot API key as "
+                                  "X-API-Key (or Authorization: Bearer ...)"}),
+                401)
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "body must be a JSON object"}), 400
+    room_id = str(data.get("room_id") or "").strip()
+    if room_id and not room_id.startswith("!"):
+        return jsonify({"error": "'room_id' must be a Matrix room id (!...)"}), 400
+    note = data.get("note", "")
+    if not isinstance(note, str):
+        return jsonify({"error": "'note' must be a string"}), 400
+    invite = data.get("invite")
+    if invite is not None and (not isinstance(invite, list)
+                               or not all(isinstance(u, str) and u.startswith("@")
+                                          for u in invite)):
+        return jsonify({"error": "'invite' must be a list of \"@user:domain\" ids"}), 400
+    try:
+        ring_seconds = int(data.get("ring_seconds")
+                           or (bot.cfg.call.ring_seconds))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'ring_seconds' must be an integer"}), 400
+    ring_seconds = max(5, min(ring_seconds, 300))
+
+    calls = getattr(bot, "calls", None)
+    if calls is None:
+        return (jsonify({"error": f"bot '{bot.name}' has no call support active — "
+                                  "needs \"call\": {\"enabled\": true} in bots.json "
+                                  "and the livekit/voice requirements installed"}),
+                503)
+    try:
+        room_id = room_id or bot.ensure_room()
+        room_name = bot.client.get_room_name(room_id)
+    except MatrixError as exc:
+        return jsonify({"error": f"matrix operation failed: {exc}"}), 502
+    err = calls.place_call(room_id, room_name, note=note, invite=invite,
+                           ring_seconds=ring_seconds)
+    if err:
+        return jsonify({"ok": False, "error": err, "bot": bot.name,
+                        "room": room_id}), 409
+    return jsonify({"ok": True, "bot": bot.name, "room": room_id,
+                    "ring_seconds": ring_seconds})
 
 
 def main() -> None:

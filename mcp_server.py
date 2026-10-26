@@ -14,6 +14,8 @@ Tools:
     react            add an emoji reaction to a specific message
     wait_for_reply   block for the next message in a room (that message is
                      delivered to you and skips the bot's configured triggers)
+    place_call       place an outgoing MatrixRTC voice call (Element clients
+                     in the room get an incoming-call notification)
 
 Environment:
     MCP_BOT               default bot to use when a tool doesn't get one
@@ -67,7 +69,8 @@ if DEFAULT_BOT and DEFAULT_BOT not in BOTS:
 mcp = FastMCP("matrix-webhooker")
 
 #: wait_for_reply is served by the long-lived HTTP server (server.py), which
-#: owns the message watcher and the trigger/wait registry.
+#: owns the message watcher and the trigger/wait registry.  place_call needs
+#: it too — the CallManager lives in that process.
 WEBHOOKER_URL = os.environ.get(
     "MATRIX_WEBHOOKER_URL", "http://localhost:8080").rstrip("/")
 MAX_WAIT_TIMEOUT = 600
@@ -205,6 +208,44 @@ def wait_for_reply(room: str, bot: str = "", timeout: int = 120) -> dict:
             f"matrix-webhooker server unreachable at {WEBHOOKER_URL} ({exc}). "
             "wait_for_reply is served by the long-lived server.py process (it "
             "owns the triggers); start it (python3 server.py / docker compose) "
+            "or set MATRIX_WEBHOOKER_URL.") from exc
+    if resp.status_code >= 400:
+        raise ValueError(f"matrix-webhooker error ({resp.status_code}): "
+                         f"{resp.text.strip()[:300]}")
+    return resp.json()
+
+
+@mcp.tool()
+def place_call(room: str = "", bot: str = "", note: str = "",
+               ring_seconds: int = 30) -> dict:
+    """Place an outgoing voice call (MatrixRTC / Element Call) as the bot.
+
+    Publishes the bot's call membership in `room` (room id `!...`; empty =
+    the bot's alert room) and sends the room's other members an incoming-call
+    notification — Element clients ring and can pick up. Once picked up the
+    bot speaks `note` (e.g. why it is calling), then answers what is said
+    aloud, exactly like an incoming call. If nobody picks up within
+    `ring_seconds` (5..300, default 30) the bot hangs up again.
+
+    Requires the matrix-webhooker HTTP server to be running (it owns the
+    call manager) and the bot to have "call" configured in bots.json."""
+    b = _resolve_bot(bot)
+    room = room.strip()
+    if room and not room.startswith("!"):
+        raise ValueError("'room' must be a Matrix room id (!...) — use list_rooms first")
+    ring_seconds = max(5, min(int(ring_seconds), 300))
+    try:
+        resp = requests.post(
+            f"{WEBHOOKER_URL}/call",
+            headers={"X-API-Key": b.cfg.api_key},
+            json={"room_id": room, "note": note, "ring_seconds": ring_seconds},
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise ValueError(
+            f"matrix-webhooker server unreachable at {WEBHOOKER_URL} ({exc}). "
+            "place_call is served by the long-lived server.py process (it owns "
+            "the call manager); start it (python3 server.py / docker compose) "
             "or set MATRIX_WEBHOOKER_URL.") from exc
     if resp.status_code >= 400:
         raise ValueError(f"matrix-webhooker error ({resp.status_code}): "

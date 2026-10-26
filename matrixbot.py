@@ -159,6 +159,13 @@ class CallConfig:
     silence_end: float = 0.9        # seconds of silence closing an utterance
     min_speech: float = 0.35        # shorter blips are dropped
     max_utterance: float = 20.0     # seconds before an utterance is cut off
+    # outgoing calls (POST /call, MCP place_call)
+    ring_seconds: int = 30          # how long the callee has to pick up
+    no_answer_message: str = ""     # posted to the room when nobody picks up
+                                    # (empty = post nothing)
+    call_message: str = ""          # posted when the bot calls out, so the
+                                    # callee can join even if their client
+                                    # does not ring; supports {{link}}
 
     def matches(self, room_id: str, room_name: str | None) -> bool:
         if not self.rooms:
@@ -197,12 +204,15 @@ def call_config_from(entry: dict, path: Path, templates: dict) -> CallConfig:
         max_utterance = float(raw.get("max_utterance", 20.0))
         cue_after = float(raw.get("cue_after", 2.0))
         max_answer_chars = int(raw.get("max_answer_chars", 220))
+        ring_seconds = int(raw.get("ring_seconds", 30))
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"{path}: 'call': numeric setting is not a number: {exc}") from exc
     if not 1 <= context <= 100:
         raise ConfigError(f"{path}: 'call.context' must be between 1 and 100")
     if not 30 <= max_seconds <= 7200:
         raise ConfigError(f"{path}: 'call.max_seconds' must be between 30 and 7200")
+    if not 5 <= ring_seconds <= 300:
+        raise ConfigError(f"{path}: 'call.ring_seconds' must be between 5 and 300")
     return CallConfig(
         enabled=bool(raw.get("enabled", True)),
         action=action,
@@ -223,6 +233,9 @@ def call_config_from(entry: dict, path: Path, templates: dict) -> CallConfig:
         silence_end=silence_end,
         min_speech=min_speech,
         max_utterance=max_utterance,
+        ring_seconds=ring_seconds,
+        no_answer_message=str(raw.get("no_answer_message") or ""),
+        call_message=str(raw.get("call_message") or ""),
     )
 
 
@@ -851,6 +864,21 @@ class Matrix:
 
     def join(self, room_id: str) -> None:
         self._request("POST", f"{self.hs}/_matrix/client/v3/rooms/{quote(room_id)}/join")
+
+    def joined_members(self, room_id: str) -> list[str]:
+        """User ids of the room's joined members (needs auth in the room)."""
+        data = self._request("GET", f"{self.hs}/_matrix/client/v3/rooms/"
+                                    f"{quote(room_id, safe='')}/joined_members")
+        return list((data.get("joined") or {}).keys())
+
+    def send_to_device(self, event_type: str, messages: dict) -> dict:
+        """Send a to-device event.  ``messages`` maps user id -> device id
+        (``"*"`` = every session) -> content — e.g. the MSC4184
+        ``m.call.notify`` that makes an Element Call client ring."""
+        txn = f"whk-{secrets.token_hex(8)}"
+        url = (f"{self.hs}/_matrix/client/v3/sendToDevice/"
+               f"{quote(event_type, safe='')}/{txn}")
+        return self._request("PUT", url, {"messages": messages})
 
     def create_room(self, name: str, invite: str | None, topic: str = "") -> str:
         payload: dict = {

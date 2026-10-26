@@ -67,7 +67,11 @@ async def run_caller(bot: Bot, room_id: str, question: str, seconds: float,
     pcm = resample(pcm, rate, OUT_RATE)
     print(f"caller: asking {len(pcm) / 2 / OUT_RATE:.1f}s of audio")
 
-    token = bot.client.livekit_token(room_id, "m.call#")      # legacy /sfu/get
+    # own LiveKit identity (MSC4195 /get_token path): the legacy /sfu/get
+    # token carries the *bot's* identity — LiveKit then makes two
+    # same-identity participants invisible to each other. Real clients have
+    # their own userId:deviceId, so only this fake caller needs the trick.
+    token = bot.client.livekit_token(room_id, "m.call#ROOM", "mw-fake-caller")
     room = rtc.Room()
     source = rtc.AudioSource(OUT_RATE, 1)
     track = rtc.LocalAudioTrack.create_audio_track("caller", source)

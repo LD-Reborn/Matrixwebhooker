@@ -16,6 +16,15 @@ joins a call that someone else started in a room it is in:
      ``stop`` arrives, or ``max_seconds`` elapse) we withdraw our membership
      and leave.
 
+The bot can also *place* the call itself (``CallManager.place_call``, behind
+``POST /call`` and the MCP ``place_call`` tool): we publish our own
+membership (the legacy session shape current Element clients use — empty
+``call_id``, which is the same SFU slot calls in these rooms land in), send
+each other room member an MSC4184 ``m.call.notify`` to-device event so their
+Element client rings, and wait up to ``ring_seconds``.  When they pick up we
+speak the ``note`` (or the greeting); when nobody does we leave and post
+``no_answer_message`` to the room.
+
 The media side needs the optional ``livekit`` package; without it the module
 still imports and the bot just reports that it cannot answer calls.
 """
@@ -143,6 +152,44 @@ def left_membership(template: dict, *, user_id: str, device_id: str,
     return key, {}
 
 
+def outgoing_template(client) -> tuple[dict, list[dict]]:
+    """The membership event we publish when *we* place a call.
+
+    Shaped like the sessions current Element clients create themselves
+    (MSC3401 legacy: state key ``_<user>_<device>_m.call``, empty
+    ``call_id``, ``membershipID`` = ``userId:deviceId``) — that is exactly
+    the shape whose SFU slot (the JWT service's default, ``m.call#ROOM``)
+    calls in these rooms land in today, so a picking-up client meets us in
+    the same LiveKit room.  Returns ``(template, foci_preferred)``.
+    """
+    user_id = client.user_id
+    device_id = client.device_id or ""
+    transports = client.rtc_transports()
+    service_url = next((t.get("livekit_service_url") for t in transports
+                        if t.get("livekit_service_url")), "")
+    foci = ([{"livekit_service_url": service_url}] if service_url
+            else [{"type": "livekit", "url": t["url"]}
+                  for t in transports if t.get("url")])
+    content = {
+        "application": "m.call",
+        "call_id": "",                       # the room's default session slot
+        "device_id": device_id,
+        "expires": 14400000,                 # 4 h, like Element Call
+        "foci_preferred": foci,
+        "focus_active": {"focus_selection": "multi_sfu", "type": "livekit"},
+        "m.call.intent": "audio",
+        "membershipID": f"{user_id}:{device_id}",
+        "scope": "m.room",
+    }
+    template = {
+        "type": "org.matrix.msc3401.call.member",
+        "state_key": f"_{user_id}_{device_id}_m.call",
+        "sender": user_id,
+        "content": content,
+    }
+    return template, foci
+
+
 def _rms(data: bytes) -> float:
     samples = array.array("h", data)
     if not samples:
@@ -177,8 +224,16 @@ class CallSession:
     """A single answered call in one room (runs its own asyncio loop)."""
 
     def __init__(self, manager: "CallManager", room_id: str, room_name: str | None,
-                 template: dict):
-        """``template`` is the caller's *whole* membership event: we mirror it."""
+                 template: dict, *, outgoing: bool = False, note: str = "",
+                 invite: list[str] | None = None, foci: list[dict] | None = None,
+                 ring_seconds: int = 0):
+        """``template`` is the caller's *whole* membership event: we mirror it.
+
+        For an outgoing call the "template" is our own freshly built
+        membership (``outgoing_template``); we then ring ``invite`` via
+        MSC4184 to-device notifications and speak ``note`` once they pick
+        up (instead of the plain greeting).
+        """
         self.mgr = manager
         self.bot: Bot = manager.bot
         self.cfg: CallConfig = manager.cfg
@@ -187,6 +242,11 @@ class CallSession:
         self.template = template
         self.template_type = template.get("type") or "org.matrix.msc3401.call.member"
         self.sticky = is_sticky(template.get("content") or {})
+        self.outgoing = outgoing
+        self.note = note
+        self.invite = invite or []
+        self.foci = foci or []
+        self.ring_seconds = ring_seconds or self.cfg.ring_seconds
         device_id = self.bot.client.device_id or ""
         #: the identity we join the SFU with *and* publish as membershipID —
         #: legacy Element Call expects "userId:deviceId" (what its own /sfu/get
@@ -196,6 +256,8 @@ class CallSession:
         self.started = time.monotonic()
         self.stopping = threading.Event()
         self.utterances = 0
+        self.answered = not outgoing    # an answered call counts as picked up
+        self.rang_out = False           # outgoing, nobody picked up
         # utterance assembly (energy VAD)
         self._buf = bytearray()
         self._speech = 0.0
@@ -266,13 +328,17 @@ class CallSession:
             device_id=self.bot.client.device_id or "", member_id=self.member_id,
             sfu_url=sfu_url, service_url=service_url)
         try:
-            self.bot.client.send_state(self.room_id, self.template_type, key, content)
+            resp = self.bot.client.send_state(self.room_id, self.template_type,
+                                              key, content)
         except MatrixError as exc:
             _log(f"{self.tag} publishing call membership failed: {exc} "
                  "(the bot needs power level >= 50 in this room)")
             return
         _log(f"{self.tag} joined {self.template_type} slot {slot} as {self.member_id} "
              f"(state key {key!r}) via {sfu_url}")
+        if self.outgoing:
+            self._send_call_notify((resp or {}).get("event_id") or "")
+            self._post_call_message()
 
         room = rtc.Room()
         source = rtc.AudioSource(OUT_RATE, 1)
@@ -283,21 +349,29 @@ class CallSession:
         @room.on("track_subscribed")
         def _(tr, publication, participant):
             if tr.kind == rtc.TrackKind.KIND_AUDIO:
+                self.answered = True
                 incoming.put_nowait((tr, participant.identity))
 
         try:
             await room.connect(sfu_url, token["jwt"])
             _log(f"{self.tag} livekit room {room.name}: "
                  f"{[p.identity for p in room.remote_participants.values()]}")
+            if room.remote_participants:
+                self.answered = True
             await room.local_participant.publish_track(track)
 
             tasks = [asyncio.create_task(self._pump_incoming(incoming)),
                      asyncio.create_task(self._refresh_membership()),
                      asyncio.create_task(self._greet())]
             deadline = self.started + self.cfg.max_seconds
+            ring_deadline = self.started + self.ring_seconds
             while not self.stopping.is_set():
                 if time.monotonic() > deadline:
                     _log(f"{self.tag} max_seconds reached")
+                    break
+                if self.outgoing and not self.answered and time.monotonic() > ring_deadline:
+                    _log(f"{self.tag} nobody picked up in {self.ring_seconds}s")
+                    self.rang_out = True
                     break
                 await asyncio.sleep(0.5)
             for t in tasks:
@@ -317,6 +391,63 @@ class CallSession:
             except Exception:  # noqa: BLE001
                 pass
             _log(f"{self.tag} left ({self.utterances} utterance(s) handled)")
+            if self.rang_out and self.cfg.no_answer_message:
+                try:
+                    self.bot.client.send_message(
+                        self.room_id, {"msgtype": "m.notice",
+                                       "body": self.cfg.no_answer_message})
+                except MatrixError as exc:
+                    _log(f"{self.tag} posting the no-answer note failed: {exc}")
+
+    def _send_call_notify(self, event_id: str) -> None:
+        """MSC4184: tell the invitees' clients to ring for this call.
+
+        Sent twice per user (unstable + final event type) — clients picked up
+        one or the other depending on their vintage; the stranger is ignored.
+        The focus entries must carry the ``type: livekit`` discriminant:
+        rust-sdk based clients (Element X) fail to parse the notification
+        without it and silently drop it.
+        """
+        if not event_id:
+            _log(f"{self.tag} membership event has no id — cannot ring anyone")
+            return
+        if not self.invite:
+            _log(f"{self.tag} nobody else in the room to ring")
+            return
+        call_id = str((self.template.get("content") or {}).get("call_id", ""))
+        foci = [{"type": "livekit", **{k: v for k, v in f.items() if k != "type"}}
+                for f in self.foci]
+        for user in self.invite:
+            content = {
+                "invitee": {"user_id": user},
+                "event_id": event_id,
+                "room_id": self.room_id,
+                "call_id": call_id,
+                "foci_preferred": foci,
+                "reason": "user_invite",
+            }
+            for etype in ("org.matrix.msc4184.call.notify", "m.call.notify"):
+                try:
+                    self.bot.client.send_to_device(etype, {user: {"*": content}})
+                except MatrixError as exc:
+                    _log(f"{self.tag} {etype} to {user} failed: {exc}")
+            _log(f"{self.tag} rang {user} ({len(self.invite)} invitee(s))")
+
+    def _post_call_message(self) -> None:
+        """Visible timeline fallback for the outgoing call: clients that do
+        not ring for ``m.call.notify`` can still join via the call link."""
+        if not self.cfg.call_message:
+            return
+        link = f"https://call.element.io/#/room/{self.room_id}"
+        body = render_text(self.cfg.call_message, {"link": link})
+        try:
+            self.bot.client.send_message(self.room_id, {
+                "msgtype": "m.text", "body": body,
+                "format": "org.matrix.custom.html",
+                "formatted_body": body.replace(link, f'<a href="{link}">{link}</a>'),
+            })
+        except MatrixError as exc:
+            _log(f"{self.tag} posting the call message failed: {exc}")
 
     async def _refresh_membership(self) -> None:
         """Re-PUT our membership so it never looks stale to other clients."""
@@ -338,8 +469,27 @@ class CallSession:
         seconds: callers had already asked their question and then heard the
         greeting *after* it.  The audio is cached, so it starts at once and
         barge-in cuts it off.
+
+        Outgoing calls are the mirror case: we wait until the callee has
+        actually picked up, then speak ``note`` (an alert's message — why we
+        are calling) if given, else the greeting.
         """
         import asyncio
+        if self.outgoing:
+            while not self.stopping.is_set() and not self.answered:
+                await asyncio.sleep(0.5)
+            if self.stopping.is_set() or not self.answered:
+                return
+            text = self.note or self.cfg.greeting
+            if not text:
+                return
+            if self.utterances or self._in_speech or self._speech:
+                _log(f"{self.tag} greeting skipped (the callee already spoke)")
+                return
+            if self.note:
+                text = clip_for_speech(text, self.cfg.max_answer_chars)
+            await self._speak(text, cached=not self.note)
+            return
         if not self.cfg.greeting:
             return
         await asyncio.sleep(0.3)
@@ -713,6 +863,48 @@ class CallManager:
         self.on_log(f"[call:{self.bot.name}] call in {room_name or room_id}: joining")
         session.start()
 
+    def place_call(self, room_id: str, room_name: str | None = None, *,
+                   note: str = "", invite: list[str] | None = None,
+                   ring_seconds: int = 0) -> str | None:
+        """Place an outgoing call in ``room_id`` (the bot publishes the call
+        and rings the room's other members).  Returns an error string, or
+        ``None`` once the call is under way."""
+        if not self.cfg.enabled:
+            return "calls are not enabled for this bot (bots.json: \"call\")"
+        if self.speech is None:
+            return "VOICE_BASE_URL is not set — cannot place calls"
+        try:
+            import livekit  # noqa: F401 - optional dependency
+        except ImportError:
+            return "the 'livekit' package is missing (pip install livekit)"
+        with self._lock:
+            current = self._sessions.get(room_id)
+            if current is not None and not current.stopping.is_set():
+                return "a call is already running in this room"
+        # joined_members also forces the login (we need the device_id first)
+        try:
+            members = self.bot.client.joined_members(room_id)
+        except MatrixError:
+            try:
+                self.bot.client.join(room_id)
+                members = self.bot.client.joined_members(room_id)
+            except MatrixError as exc:
+                return f"cannot read the room's members: {exc}"
+        targets = [m for m in (invite or members) if m != self.bot.user_id]
+        template, foci = outgoing_template(self.bot.client)
+        session = CallSession(self, room_id, room_name, template, outgoing=True,
+                              note=note, invite=targets, foci=foci,
+                              ring_seconds=ring_seconds)
+        with self._lock:
+            current = self._sessions.get(room_id)
+            if current is not None and not current.stopping.is_set():
+                return "a call is already running in this room"
+            self._sessions[room_id] = session
+        self.on_log(f"[call:{self.bot.name}] placing call in {room_name or room_id}: "
+                    f"ringing {', '.join(targets) or '(nobody else in the room)'}")
+        session.start()
+        return None
+
     def _drop(self, room_id: str) -> None:
         with self._lock:
             self._sessions.pop(room_id, None)
@@ -733,7 +925,8 @@ class CallManager:
         with self._lock:
             sessions = list(self._sessions.values())
         return [{"room": s.room_id, "seconds": round(time.monotonic() - s.started),
-                 "utterances": s.utterances} for s in sessions]
+                 "utterances": s.utterances, "outgoing": s.outgoing,
+                 "answered": s.answered} for s in sessions]
 
     def session_finished(self, session: CallSession) -> None:
         with self._lock:
