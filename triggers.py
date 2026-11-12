@@ -12,7 +12,9 @@ bot receives — any channel it is in, including DMs — in this order:
      started is interrupted (``opencode_api``), any pending waiters (a model
      blocked in ``wait_for_reply``) are released, and every wrench reaction
      added while it was handled is removed again.  The stop command is never
-     delivered to a waiter or fired as a trigger.
+     delivered to a waiter or fired as a trigger.  It is acked by *reacting*
+     to the stop message (🛑 something stopped / ⭕ nothing was running) —
+     a text ack would re-trigger other bots in multi-bot rooms (echo loops).
   2b. ``/effort`` (list the reasoning-effort levels of the room) and
       ``/effort <default|low|mid|high|xhigh>`` (set it for the room, persisted
       in the bot's state dir) — the room's level becomes the model
@@ -73,6 +75,10 @@ MAX_WAIT_SECONDS = 600
 #: The reaction the bot adds to a message while it is being handled, and
 #: removes again as soon as handling of that message is over.
 WRENCH_REACTION = "🔧"
+#: reactions acking a bare "stop" — never a text message: in multi-bot
+#: rooms an ack text re-triggers the other bots (endless echo loops)
+STOP_REACTION = "🛑"
+NOTHING_TO_STOP_REACTION = "⭕"
 
 #: When the watcher sees a room for the first time mid-run, the bot has just
 #: joined it and /sync delivers part of that room's recent history along
@@ -667,9 +673,16 @@ class MessageWatcher:
         except MatrixError as exc:
             _log(f"{self.tag} sending the room notice failed: {exc}")
 
-    def _stop_room(self, room_id: str, where: str) -> None:
+    def _stop_room(self, room_id: str, where: str, event_id: str = "") -> None:
         """Handle a bare "stop" in ``room_id``: interrupt the run, release
-        waiters, leave any call and clean up the wrench reactions."""
+        waiters, leave any call and clean up the wrench reactions.
+
+        Acknowledged by reacting to the stop message itself — 🛑 when
+        something was actually stopped, ⭕ when nothing was running. A
+        text ack must not be used here: in multi-bot rooms it re-triggers
+        the other bots, which then stop nothing and text back — an echo
+        loop that produces nothing but noise.
+        """
         key = room_id.casefold()
         with self._session_lock:
             active = list(self._sessions.get(key, []))
@@ -682,16 +695,14 @@ class MessageWatcher:
         hung_up = calls is not None and room_id in [s["room"] for s in calls.status()]
         if hung_up:
             calls.stop_room(room_id, "stop command")
-        if active:
-            ack = "⏹ Stopped."
-        elif cancelled:
-            ack = "⏹ Stop sent (waiting model released)."
-        elif hung_up:
-            ack = "⏹ Left the call."
-        else:
-            ack = "⏹ Nothing was running."
-        self._send_note(room_id, ack)
-        _log(f"{self.tag} {where} -> stopped: {len(active)} run(s), "
+        ack = (STOP_REACTION if (active or cancelled or hung_up)
+               else NOTHING_TO_STOP_REACTION)
+        if event_id:
+            try:
+                self.bot.client.react(room_id, event_id, ack)
+            except MatrixError as exc:
+                _log(f"{self.tag} stop ack on {event_id} failed: {exc}")
+        _log(f"{self.tag} {where} -> stopped ({ack}): {len(active)} run(s), "
              f"{cancelled} waiter(s) released, call left={hung_up}")
 
     # -- /effort command --------------------------------------------------------
@@ -779,7 +790,7 @@ class MessageWatcher:
         where = f"room={room_name or room_id}"
 
         if is_stop_command(ev.get("body")):
-            self._stop_room(room_id, where)
+            self._stop_room(room_id, where, ev.get("event_id") or "")
             return
 
         is_effort, level = parse_effort_command(ev.get("body"))

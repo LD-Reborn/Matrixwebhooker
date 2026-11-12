@@ -272,7 +272,10 @@ whole rule: a sentence that merely starts with "stop" such as
 2. releases any model blocked in `wait_for_reply` for that room
    (`POST /wait` returns `{"stopped": true, "received": null}`);
 3. removes every wrench reaction it added for that room;
-4. replies with a short confirmation (`⏹ Stopped.` / `⏹ Stop sent …`).
+4. acks **by reacting** to the stop message itself — 🛑 when something was
+   actually stopped, ⭕ when nothing was running. There is deliberately no
+   text confirmation: in multi-bot rooms a text ack re-triggers the other
+   bots (which stop nothing and text back), an echo loop of nothing.
 
 > Since actions run inside the OpenCode server (nothing is spawned per
 > message), stopping is an API interrupt — the old `opencode run
