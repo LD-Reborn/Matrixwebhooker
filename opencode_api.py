@@ -17,7 +17,9 @@ Flow per action (verified against opencode v2.1.4):
   3. ``POST /api/session/<id>/prompt``  admit the user text (async);
   4. poll ``GET /api/session/<id>/message`` (newest first) until an ``idle``
      message appears — its ``outcome`` is succeeded/failed/interrupted; the
-     answer is the text of the newest assistant message;
+     answer is the text of the newest assistant message; permission asks
+     are auto-approved in between (``GET/POST /api/session/<id>/permission``)
+     so a headless session can never block on an invisible prompt;
   5. ``POST /api/session/<id>/interrupt`` stops a running turn (the room's
      bare ``stop``), ``DELETE /api/session/<id>`` cleans up.
 
@@ -156,6 +158,35 @@ class OpenCodeClient:
         self._req("POST", f"/api/session/{session_id}/prompt",
                   {"text": text, "delivery": "steer"})
 
+    def approve_permissions(self, session_id: str, seen: set,
+                            log) -> None:
+        """Auto-approve pending permission asks (headless: nobody to ask).
+
+        A rule that resolves to ``ask`` blocks the session until a client
+        replies — with no client attached that turn just hangs until the
+        run times out, so every request is approved with ``once``.
+        ``seen`` tracks already-answered request ids; the global config
+        blanket-allow normally means this list stays empty anyway.
+        """
+        try:
+            reqs = self._req("GET",
+                             f"/api/session/{session_id}/permission").get("data") or []
+        except OpenCodeError:            # session already gone
+            return
+        for req in reqs:
+            rid = req.get("id")
+            if not rid or rid in seen:
+                continue
+            seen.add(rid)
+            what = f"{req.get('action')} {' '.join(req.get('resources') or [])}"
+            log(f"[opencode] auto-approving permission {rid}: {what[:200]}")
+            try:
+                self._req("POST",
+                          f"/api/session/{session_id}/permission/{rid}/reply",
+                          {"decision": "once"})
+            except OpenCodeError as exc:  # already answered / session gone
+                log(f"[opencode] permission reply failed: {exc}")
+
     def interrupt(self, session_id: str) -> None:
         """Best-effort: a session that already finished answers 404/no-op."""
         try:
@@ -195,6 +226,7 @@ class OpenCodeClient:
                 self.set_system_prompt(result.session_id, system)
             self.send_prompt(result.session_id, prompt)
 
+            seen_perms: set = set()
             deadline = time.monotonic() + timeout
             while True:
                 if cancel is not None and cancel():
@@ -208,6 +240,7 @@ class OpenCodeClient:
                     result.outcome = "timeout"
                     return result
                 time.sleep(POLL_SECONDS)
+                self.approve_permissions(result.session_id, seen_perms, log)
                 messages = self._req(
                     "GET", f"/api/session/{result.session_id}/message").get("data") or []
                 idle = next((m for m in messages if m.get("type") == "idle"), None)
