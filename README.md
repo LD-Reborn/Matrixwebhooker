@@ -211,6 +211,27 @@ triggers reference (and can override field by field):
   and waits) don't block the watcher. Restart the server after editing
   `bots.json` to load changes.
 
+### Mention gate (tagged someone else?)
+
+In rooms where several bots (or humans) listen, a message that *tags*
+someone is meant for that person, not for the whole room. A bot
+therefore reacts once **it is tagged too** — alone or among others:
+
+| message | bot `@du` reacts? |
+|---|---|
+| `wer hat Zeit?` (tags nobody) | yes — addressed to the whole room |
+| `@du kann das gehen?` | yes — it is tagged |
+| `@jemandanderes blablabla und bitte @du mach blablabla` | yes — tagged among others |
+| `@jemandanderes mach das mal` | **no** — clearly not for the bot |
+| `@room Hilfe!` | yes — a broadcast tags everyone |
+
+"Tagged" means the client's `m.mentions` property (mention pills) or a
+literal `@user:server` in the text; quoted reply fallback lines
+(`> <@user:server> …`) do not count as a tag. The gate covers the whole
+pipeline — no trigger fires and a message is not handed to a waiting
+client either. Commands (`stop`, `/effort`, `/btw`) are unaffected, and
+the bot's own messages are skipped anyway.
+
 ### Waiting for a reply
 
 Ask a question and block for the answer instead of firing a trigger:

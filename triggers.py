@@ -22,6 +22,13 @@ bot receives — any channel it is in, including DMs — in this order:
   2c. ``/btw <text>`` interjects into the action(s) currently running for
       that room (OpenCode inbox ``steer`` delivery) instead of starting a
       new run or feeding a waiter.
+  2d. mention gate: a message that *tags* someone explicitly (an
+      ``m.mentions`` pill, or a plain ``@user:server`` in the text) is
+      meant for that person — the bot stays completely silent unless it is
+      tagged **too** (alone or among others; ``@room``/``@here`` tag it as
+      well). Messages that tag nobody are for everyone and handled as
+      before. This keeps one bot from answering messages another bot (or
+      human) was addressed with.
   3. if a client is waiting for a reply in that room (``POST /wait``, or
      the MCP ``wait_for_reply`` tool), the message is handed to the oldest
      waiter instead of running any triggers.  While a trigger run for that
@@ -108,6 +115,50 @@ def is_stop_command(body: str | None) -> bool:
     if not text or re.search(r"\s", text):
         return False
     return text.casefold().lstrip("/").rstrip("!?.…:;") == "stop"
+
+
+#: a full Matrix user id in plain text — typed by hand or the reply-fallback
+#: quote clients put in front of a reply
+_MXID_RE = re.compile(r"@[A-Za-z0-9._=/+-]+:[A-Za-z0-9.-]+")
+#: quoted reply-fallback lines (``> <@user:server> …``): they quote someone
+#: else's message instead of tagging them — not a tag by this sender
+_QUOTED_RE = re.compile(r"^\s*>.*$", re.MULTILINE)
+
+
+def extract_mentions(ev: dict) -> set[str]:
+    """User ids (lower-cased) that a message event explicitly tags.
+
+    The canonical source is the ``m.mentions`` property (kept as
+    ``ev["mentions"]`` by ``matrixbot.sync()``) that clients set for pills;
+    full ``@user:server`` strings in the plain body count too, since not
+    every client sends ``m.mentions``. Quoted reply-fallback lines are
+    ignored: they belong to the quoted message, not to this sender.
+    """
+    ids: set[str] = set()
+    prop = ev.get("mentions")
+    if isinstance(prop, dict):
+        for uid in prop.get("user_ids") or []:
+            if isinstance(uid, str):
+                ids.add(uid.casefold())
+    body = ev.get("body") or ""
+    ids.update(x.casefold() for x in _MXID_RE.findall(_QUOTED_RE.sub("", body)))
+    return ids
+
+
+def addressed_to_bot(ev: dict, user_id: str) -> bool:
+    """Whether the bot may act on this message at all (mention gate).
+
+    A message that tags nobody is addressed to the whole room and the bot
+    reacts as configured. But once the sender tags someone explicitly, the
+    message is clearly meant for that person: the bot only reacts when it
+    is tagged *too* (alone or among others). ``@room``/``@here`` broadcasts
+    tag the bot as well and therefore always count.
+    """
+    prop = ev.get("mentions")
+    if isinstance(prop, dict) and prop.get("room"):
+        return True
+    mentions = extract_mentions(ev)
+    return not mentions or user_id.casefold() in mentions
 
 
 #: the reasoning-effort levels ``/effort`` accepts, mapped to the OpenCode
@@ -418,6 +469,7 @@ class MessageWatcher:
                     "event_type": "m.room.message",
                     "body": content["body"],
                     "msgtype": content.get("msgtype", "m.text"),
+                    "mentions": content.get("m.mentions"),
                 })
             if left:
                 entry["events"] = left
@@ -612,7 +664,8 @@ class MessageWatcher:
             out.append({**ev,
                         "event_type": "m.room.message",
                         "body": content["body"],
-                        "msgtype": content.get("msgtype", "m.text")})
+                        "msgtype": content.get("msgtype", "m.text"),
+                        "mentions": content.get("m.mentions")})
         return out
 
     # -- wrench reactions -----------------------------------------------------
@@ -801,6 +854,11 @@ class MessageWatcher:
         is_btw, btw_text = parse_btw_command(ev.get("body"))
         if is_btw:
             self._btw_room(room_id, btw_text, ev)
+            return
+
+        if not addressed_to_bot(ev, self.bot.user_id):
+            _log(f"{self.tag} {where} sender={ev.get('sender')} -> ignored "
+                 f"(tags someone else, not this bot)")
             return
 
         if self.waiters.deliver(self.bot.name, room_id, ev):

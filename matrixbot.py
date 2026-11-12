@@ -606,8 +606,9 @@ class Matrix:
         "to_device": [...]}``. Events are the *new* m.room.message /
         m.room.encrypted events of the joined rooms (oldest first, per room),
         each with ``room_id``, ``room_name``, ``event_id``, ``sender``, ``ts``
-        and, for plaintext ones, ``msgtype``/``body``; encrypted ones carry
-        ``raw`` (Megolm material) for decryption by ``Bot.crypto``. ``state``
+        and, for plaintext ones, ``msgtype``/``body`` (plus ``mentions``, the
+        raw ``m.mentions`` property, when the message tags anyone); encrypted
+        ones carry ``raw`` (Megolm material) for decryption by ``Bot.crypto``. ``state``
         holds *changed* room state of interest (room name plus the MatrixRTC
         call-membership events, see CALL_STATE_TYPES — those are picked out of
         the timeline, because /sync only sends state deltas when the timeline
@@ -684,6 +685,9 @@ class Matrix:
                     entry["event_type"] = "m.room.message"
                     entry["msgtype"] = content.get("msgtype", "m.text")
                     entry["body"] = body
+                    mentions = content.get("m.mentions")
+                    if isinstance(mentions, dict):
+                        entry["mentions"] = mentions
                 events.append(entry)
             for se in ((rdata.get("state", {}) or {}).get("events", [])) or []:
                 if se.get("type") not in CALL_STATE_TYPES:
