@@ -29,6 +29,13 @@ bot receives — any channel it is in, including DMs — in this order:
       well). Messages that tag nobody are for everyone and handled as
       before. This keeps one bot from answering messages another bot (or
       human) was addressed with.
+  2e. sibling-bot gate: messages from the roster's *other* bots (the bot
+      users in ``bots.json``) only fire triggers when this bot is tagged
+      explicitly — untagged bot chatter is ignored, so two agents cannot
+      answer each other forever. Humans are unaffected. In addition, a
+      run whose final text is exactly ``NO_REPLY`` posts nothing at all:
+      that is the escape hatch a prompt should offer the model for
+      "nothing to add".
   3. if a client is waiting for a reply in that room (``POST /wait``, or
      the MCP ``wait_for_reply`` tool), the message is handed to the oldest
      waiter instead of running any triggers.  While a trigger run for that
@@ -86,6 +93,10 @@ WRENCH_REACTION = "🔧"
 #: rooms an ack text re-triggers the other bots (endless echo loops)
 STOP_REACTION = "🛑"
 NOTHING_TO_STOP_REACTION = "⭕"
+#: the token a model replies with when it has nothing to say — the run
+#: then posts NOTHING into the room (any bot text would re-trigger the
+#: other bots listening in that room)
+SILENT_REPLY = "NO_REPLY"
 
 #: When the watcher sees a room for the first time mid-run, the bot has just
 #: joined it and /sync delivers part of that room's recent history along
@@ -145,6 +156,16 @@ def extract_mentions(ev: dict) -> set[str]:
     return ids
 
 
+def tags_bot_itself(ev: dict, user_id: str) -> bool:
+    """True when the message tags this bot explicitly: pill or plain
+    ``@user:server`` text, or an ``@room``/``@here`` broadcast (tags all).
+    """
+    prop = ev.get("mentions")
+    if isinstance(prop, dict) and prop.get("room"):
+        return True
+    return user_id.casefold() in extract_mentions(ev)
+
+
 def addressed_to_bot(ev: dict, user_id: str) -> bool:
     """Whether the bot may act on this message at all (mention gate).
 
@@ -154,11 +175,17 @@ def addressed_to_bot(ev: dict, user_id: str) -> bool:
     is tagged *too* (alone or among others). ``@room``/``@here`` broadcasts
     tag the bot as well and therefore always count.
     """
-    prop = ev.get("mentions")
-    if isinstance(prop, dict) and prop.get("room"):
-        return True
-    mentions = extract_mentions(ev)
-    return not mentions or user_id.casefold() in mentions
+    return not extract_mentions(ev) or tags_bot_itself(ev, user_id)
+
+
+def is_silent_reply(text: str | None) -> bool:
+    """True when the final assistant text is exactly the ``NO_REPLY``
+    token (punctuation and case tolerated) — the model's way of saying
+    "nothing to add", and the run then posts nothing at all.
+    """
+    if not text:
+        return False
+    return text.strip().strip(".!?,;:…\"'«»()[]").casefold() == SILENT_REPLY.casefold()
 
 
 #: the reasoning-effort levels ``/effort`` accepts, mapped to the OpenCode
@@ -328,9 +355,14 @@ class MessageWatcher:
 
     SYNC_TIMEOUT_MS = 30000
 
-    def __init__(self, bot: Bot, waiters: WaitRegistry):
+    def __init__(self, bot: Bot, waiters: WaitRegistry,
+                 peer_ids=frozenset()):
         self.bot = bot
         self.waiters = waiters
+        #: user ids of the roster's *other* bots (from bots.json): their
+        #: messages only fire triggers when this bot is tagged explicitly,
+        #: otherwise two agents answer each other forever
+        self._peer_bots = frozenset(x.casefold() for x in peer_ids)
         self._since: str | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -861,6 +893,13 @@ class MessageWatcher:
                  f"(tags someone else, not this bot)")
             return
 
+        sender = (ev.get("sender") or "").casefold()
+        if (sender and sender in self._peer_bots
+                and not tags_bot_itself(ev, self.bot.user_id)):
+            _log(f"{self.tag} {where} sender={ev.get('sender')} -> ignored "
+                 f"(sibling bot, this bot not tagged)")
+            return
+
         if self.waiters.deliver(self.bot.name, room_id, ev):
             # Delivered to a model that is waiting for a reply.  If there is a
             # run in flight for this room, mark this message as being handled
@@ -955,7 +994,9 @@ class MessageWatcher:
         dt = time.monotonic() - started
         if result.outcome == "succeeded":
             _log(f"{tag} answered in {dt:.1f}s ({len(result.text)} chars)")
-            if result.text and not sess.cancelled:
+            if is_silent_reply(result.text):
+                _log(f"{tag} model replied {SILENT_REPLY} — nothing posted")
+            elif result.text and not sess.cancelled:
                 try:
                     self.bot.client.send_message(
                         room_id, {"msgtype": "m.text", "body": result.text})

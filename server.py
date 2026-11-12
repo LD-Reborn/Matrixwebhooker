@@ -319,6 +319,9 @@ def call_out():
 
 
 def main() -> None:
+    #: every bot user of this roster — a watcher only acts on a sibling
+    #: bot's message when it is tagged in it explicitly (no bot↔bot echoes)
+    peer_ids = frozenset(b.user_id for b in BOTS.values() if b.user_id)
     watchers: list[MessageWatcher] = []
     for bot in BOTS.values():
         trig = [t.room for t in bot.cfg.triggers]
@@ -328,7 +331,7 @@ def main() -> None:
         print(f"bot: {bot.name} ({bot.user_id}) "
               f"room={bot.room_id_cached_or_pinned() or '(resolved on first use)'} "
               f"triggers=[{', '.join(trig) or 'none'}] {call}")
-        w = MessageWatcher(bot, WAITERS)
+        w = MessageWatcher(bot, WAITERS, peer_ids=peer_ids)
         w.start()
         watchers.append(w)
     print(f"Webhooker ready: {len(BOTS)} bot(s) on {settings.homeserver} "

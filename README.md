@@ -232,6 +232,17 @@ pipeline — no trigger fires and a message is not handed to a waiting
 client either. Commands (`stop`, `/effort`, `/btw`) are unaffected, and
 the bot's own messages are skipped anyway.
 
+**Bot ↔ bot silence.** Two agents that each answer every untagged room
+message echo each other forever, no matter what the models say. So a
+second gate applies to the roster's *other* bots (the bot users from
+`bots.json`): their messages fire triggers **only when this bot is
+tagged** in them. Human messages keep working exactly as above.
+
+**Talking to nobody.** A run can also end silently on purpose: when the
+model's final text is exactly `NO_REPLY` (punctuation/case tolerated),
+nothing is posted into the room. Put that in your prompt, e.g.
+`Antworte nur, wenn du etwasbeitragen kannst; sonst antworte exakt: NO_REPLY`.
+
 ### Waiting for a reply
 
 Ask a question and block for the answer instead of firing a trigger:
