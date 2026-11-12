@@ -30,7 +30,8 @@ bot receives — any channel it is in, including DMs — in this order:
       before. This keeps one bot from answering messages another bot (or
       human) was addressed with.
   2e. sibling-bot gate: messages from the roster's *other* bots (the bot
-      users in ``bots.json``) only fire triggers when this bot is tagged
+      users in ``bots.json``, plus foreign webhookers' bots listed in the
+      top-level ``peer_bots``) only fire triggers when this bot is tagged
       explicitly — untagged bot chatter is ignored, so two agents cannot
       answer each other forever. Humans are unaffected. In addition, a
       run whose final text is exactly ``NO_REPLY`` posts nothing at all:

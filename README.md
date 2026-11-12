@@ -144,6 +144,7 @@ triggers reference (and can override field by field):
 
 ```json
 {
+  "peer_bots": ["@other-bot:domain"],
   "templates": {
     "helper": {
       "model": "ollama/bonsai-2:27b",
@@ -179,6 +180,9 @@ triggers reference (and can override field by field):
   have no display name). One bot can have many triggers.
 - `templates` — top-level object of named action objects; reference one
   with `"action": {"template": "name"}`, inline keys override it.
+- `peer_bots` — optional top-level list of bot user ids run by *other*
+  webhookers (another machine); like the roster's own bots they only fire
+  triggers when this bot is tagged in the message (see “Mention gate”).
 - `action` — what runs on the OpenCode server:
   - `prompt` — the user turn; placeholders are inserted **literally**
     (there is no shell any more, so no quoting worries):
@@ -236,7 +240,9 @@ the bot's own messages are skipped anyway.
 message echo each other forever, no matter what the models say. So a
 second gate applies to the roster's *other* bots (the bot users from
 `bots.json`): their messages fire triggers **only when this bot is
-tagged** in them. Human messages keep working exactly as above.
+tagged** in them. Bots that another webhooker runs (a second machine) are
+listed at the top level of `bots.json` — `"peer_bots":
+["@other-bot:domain", …]`. Human messages keep working exactly as above.
 
 **Talking to nobody.** A run can also end silently on purpose: when the
 model's final text is exactly `NO_REPLY` (punctuation/case tolerated),

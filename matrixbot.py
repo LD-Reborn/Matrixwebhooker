@@ -269,6 +269,10 @@ class Settings:
     state_dir: Path
     bots: list[BotConfig] = field(default_factory=list)
     templates: dict = field(default_factory=dict)  # named actions (bots.json)
+    #: user ids of bots run by *other* webhookers (e.g. on another machine);
+    #: like the roster's own bots, their messages only fire triggers when
+    #: this bot is tagged explicitly (see the sibling-bot gate in triggers.py)
+    peer_bots: list[str] = field(default_factory=list)
     opencode_url: str = "http://127.0.0.1:4096"    # opencode serve base URL
     opencode_password: str = ""                    # Basic-auth password
 
@@ -314,6 +318,11 @@ def load_settings() -> Settings:
         templates[str(tname)] = traw
 
     bots: list[BotConfig] = []
+    raw_peers = raw.get("peer_bots") or []
+    if not isinstance(raw_peers, list) or not all(
+            isinstance(p, str) for p in raw_peers):
+        raise ConfigError(f'{path}: "peer_bots" must be a list of '
+                          'user-id strings ("@bot:domain")')
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise ConfigError(f"{path}: bots[{i}] must be an object")
@@ -386,6 +395,7 @@ def load_settings() -> Settings:
         state_dir=state_dir,
         bots=bots,
         templates=templates,
+        peer_bots=[p.strip() for p in raw_peers if p.strip()],
         opencode_url=os.environ.get("OPENCODE_SERVER_URL", "").strip().rstrip("/") \
             or "http://127.0.0.1:4096",
         opencode_password=os.environ.get("OPENCODE_SERVER_PASSWORD", "").strip(),

@@ -319,9 +319,12 @@ def call_out():
 
 
 def main() -> None:
-    #: every bot user of this roster — a watcher only acts on a sibling
-    #: bot's message when it is tagged in it explicitly (no bot↔bot echoes)
-    peer_ids = frozenset(b.user_id for b in BOTS.values() if b.user_id)
+    #: every bot user of this roster plus configured peers from other
+    #: webhookers — a watcher only acts on a sibling bot's message when it
+    #: is tagged in it explicitly (no bot↔bot echoes)
+    peer_ids = frozenset(
+        [b.user_id for b in BOTS.values() if b.user_id]
+        + list(settings.peer_bots))
     watchers: list[MessageWatcher] = []
     for bot in BOTS.values():
         trig = [t.room for t in bot.cfg.triggers]
