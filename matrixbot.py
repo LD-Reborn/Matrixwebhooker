@@ -959,7 +959,10 @@ class Matrix:
             if exc.status == 404:
                 return []
             raise
-        for event in state.get("events") or []:
+        # the spec says {"events": [...]}; Synapse answers with the bare
+        # list - accept both (a wrong shape here must not crash commands)
+        events = state if isinstance(state, list) else (state or {}).get("events") or []
+        for event in events:
             if event.get("type") != "m.room.create" \
                     or event.get("state_key") != "":
                 continue
