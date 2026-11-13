@@ -371,7 +371,7 @@ plain "btw …" in chat, which stays a normal message, the `/` is required.)
 | `/revert [text]` | re-run this room's last trigger message in a fresh session — with `text`, on the updated message instead |
 | `/mute [@bot] [minutes]` | mute this bot here (no minutes = permanent; `/mute 0` unmutes) |
 | `/unmute [@bot]` | end the mute |
-| `@bot /prune <retention>` | the named bot(s) redact their own older messages (needs your redact power) |
+| `@bot /prune <retention> [@user]` | the named bot(s) redact their own (or one named user's) older messages (needs your redact power) |
 
 As with every command here: the leading `/` is required, the message must
 be the command — or the command **behind leading mentions**, so in a group
@@ -424,12 +424,14 @@ Mutes persist across restarts.
 
 Long-lived rooms (especially a bot consortium) fill up with history.
 `@bot /prune <retention>` makes every **mentioned** bot redact its **own**
-messages older than the retention window:
+messages older than the retention window; adding a user mention points the
+same walk at **that user's** messages instead:
 
 ```
 @kraken /prune 50            # keep kraken's last 50 messages
 @kraken @lucretia-pc /prune 2 weeks
 @kraken /prune 10.11.2026    # keep everything from Nov 10 on
+@kraken /prune 25 @lucretia  # keep lucretia's last 25 messages
 ```
 
 - **It must name its bot(s).** Destructive: an untagged `/prune` in a
@@ -438,8 +440,15 @@ messages older than the retention window:
   untagged `/prune` is refused with a usage note.
 - **You need the room's redact power** (your level in
   `m.room.power_levels` against the level required for `m.room.redaction`,
-  default 50). The bot itself only ever redacts its own messages — which
-  any sender may do regardless of its level.
+  default 50). Without a user mention the bot only touches its own
+  messages, which any sender could redact anyway; with one, the bot acts
+  as your hands, and the server refuses unless you hold that power.
+- **The user scope is exactly one mention.** It goes anywhere in the
+  retention text (`/prune 25 @lucretia`, `/prune @lucretia 10.11.2026`),
+  as a plain MXID, a bare `@name` (completed with the bot's own server) or
+  an Element pill. Two mentions, `@room` or `@here` are refused — the
+  retention still has to be there, so `/prune @lucretia` alone is a usage
+  note, not a wipe.
 - Retention forms: a count (`50`, `50 messages`), a span (`50 days`,
   `2 weeks`, `3 months`, `1 year`, `30 min` — also `min/h/d/w/mo/y`) or a
   date: `10.11.2026` / `10.11.` (European, day first), `11/10/2026` /

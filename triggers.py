@@ -71,10 +71,11 @@ bot receives — any channel it is in, including DMs — in this order:
       run whose final text is exactly ``NO_REPLY`` posts nothing at all:
       that is the escape hatch a prompt should offer the model for
       "nothing to add".
-  2i. ``@bot /prune <retention>`` — destructive, so it must name its
-      bot(s): every mentioned bot redacts **its own** messages older than
-      the retention window (a message count like ``50``, a span like
+  2i. ``@bot /prune <retention> [@user]`` — destructive, so it must name
+      its bot(s): every mentioned bot redacts **its own** messages older
+      than the retention window (a message count like ``50``, a span like
       ``2 weeks``, or a date like ``10.11.2026`` — see ``/help prune``),
+      or, when the command names one user too, that user's messages —
       provided the sender holds the room's redact power.  Runs as a
       cancellable room session: ``stop`` ends it, 🔧 marks it, long walks
       send 🧹 progress notes (and the summary survives the rate limit the
@@ -460,6 +461,13 @@ _PRUNE_DOTS_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})\.?(\d{2,4})?$")
 _PRUNE_SLASH_RE = re.compile(r"^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$")
 _PRUNE_ISO_RE = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})$")
 
+#: a ``@user[:domain]`` (plain or Element's mention-pill) anywhere in the
+#: arguments scopes a ``/prune`` to that user's messages
+_PRUNE_TARGET_RE = re.compile(
+    r"(?:(?P<plain>@[A-Za-z0-9._=/+-]+(?::[A-Za-z0-9.-]+)?)"
+    r"|(?P<pill>\[[^\]]*\]\(https?://matrix\.to/\#/"
+    r"(?P<mxid>(?:@|%40)[^\s)]+)\)))")
+
 #: unit spellings ``/prune <n> <unit>`` accepts, normalised; "messages"
 #: keeps a count, the rest keep a time span
 _PRUNE_UNITS = {
@@ -579,18 +587,65 @@ def parse_prune_spec(args: str) -> tuple | str:
     return ""
 
 
-def _prune_phrases(spec: tuple) -> tuple[str, str]:
-    """The two wordings of a retention spec for the summary note:
-    what was *kept*, and the state of everything already being kept."""
+def split_prune_target(args: str,
+                       bot_user_id: str) -> tuple[str, str | None, str]:
+    """Split ``/prune``'s raw arguments into ``(retention_text, target,
+    error)``.
+
+    A ``@user[:domain]`` token (plain or mention-pill) anywhere in the
+    arguments scopes the prune to *that user's* messages —
+    ``/prune 25 @lucretia`` keeps lucretia's last 25.  A bare ``@user``
+    is completed with the bot's own homeserver.  No token →
+    ``(args, None, "")``; exactly one → ``(rest, mxid, "")``; several or
+    a room-mention → ``(args, None, what-to-do-instead)``.
+    """
+    hits = list(_PRUNE_TARGET_RE.finditer(args))
+    if not hits:
+        return args, None, ""
+    if len(hits) > 1:
+        return args, None, ("a prune scopes one user at a time — "
+                            "name just one (e.g. /prune 25 @lucretia)")
+    hit = hits[0]
+    token = (hit.group("plain") or unquote(hit.group("mxid"))).rstrip(".")
+    if token.casefold() in ("@room", "@here"):
+        return args, None, ("@room/@here cannot be a prune scope — name one "
+                            "user (/prune 25 @lucretia) or leave the command "
+                            "unscoped to prune the bot's own messages")
+    domain = bot_user_id.partition(":")[2]
+    if ":" not in token and domain:
+        token = f"{token}:{domain}"
+    rest = f"{args[:hit.start()]} {args[hit.end():]}"
+    return " ".join(rest.split()), token, ""
+
+
+def _prune_owner(target: str | None, bot_user_id: str) -> str:
+    """Whose messages a prune redacts, in note wording: ``"my"`` when the
+    bot prunes itself (no scope, or scoped to itself), else the target's
+    id plus an apostrophe — the homeserver is dropped from the display
+    when it is the bot's own."""
+    if not target or target.casefold() == bot_user_id.casefold():
+        return "my"
+    display = target
+    domain = bot_user_id.partition(":")[2]
+    if display.casefold().endswith(f":{domain.casefold()}"):
+        display = display.partition(":")[0]
+    return f"{display}'s"
+
+
+def _prune_phrases(spec: tuple, owner: str = "my") -> tuple[str, str]:
+    """The two wordings of a retention spec for the notes: what was
+    *kept*, and the state of everything already being kept.  ``owner`` is
+    ``"my"`` when the bot prunes its own messages, else the target's
+    display id plus an apostrophe (``_prune_owner``)."""
     if spec[0] == "count":
-        phrase = f"my last {spec[1]} message(s)"
+        kept = f"kept {owner} last {spec[1]} message(s)"
+        within = f"already within the last {spec[1]} message(s)"
     elif spec[0] == "span":
-        phrase = f"the last {spec[2]}"
+        kept = f"kept {owner} messages from the last {spec[2]}"
+        within = f"already within the last {spec[2]}"
     else:
-        phrase = f"{spec[2]} or newer"
-    kept = f"kept {phrase}"
-    within = (f"already within {phrase}" if spec[0] != "date"
-              else f"already {phrase}")
+        kept = f"kept {owner} messages from {spec[2]} or newer"
+        within = f"already {spec[2]} or newer"
     return kept, within
 
 
@@ -685,8 +740,8 @@ HELP_TEXT = (
     "session; with text, on the updated message instead\n"
     "• /mute [@bot] [minutes] — mute this bot here (no minutes = "
     "permanent); /mute 0 or /unmute unmutes\n"
-    "• @bot /prune <retention> — the mentioned bot(s) redact their own "
-    "older messages (/help prune)\n"
+    "• @bot /prune <retention> [@user] — the mentioned bot(s) redact "
+    "their own older messages, or one named user's (/help prune)\n"
     f"Any message within {SESSION_WINDOW_SECONDS // 60} min of the last "
     "answer continues this room's session; a message starting with a "
     "zero-width character is invisible to bots. In group chats you can "
@@ -727,17 +782,20 @@ COMMAND_HELP = {
             "bot it matches mutes itself. A muted bot ignores everything "
             "except stop, /help, /status, /mute and /unmute.",
     "unmute": "🔊 /unmute [@bot] — ends the bot's mute in this room.",
-    "prune": "🧹 @bot /prune <retention> — every mentioned bot redacts "
-             "its OWN messages older than the retention window. "
-             "Destructive, so the command must name the bot(s) "
-             "(@kraken /prune 50) and you yourself need redact power in "
-             "this room. Retention: 50 or 50 messages = keep the bot's "
-             "last 50 · 50 days / 2 weeks / 3 months / 1 year / 30 min = "
-             "keep that span (also min, h, d, w, mo, y) · a date = keep "
-             "from that day: 10.11.2026 or 10.11. (European, day first), "
-             "11/10/2026 or 11/10 (US, month first), 2026-11-10 (ISO). "
-             "Long rooms are pruned in steps (redaction is rate-limited) "
-             "— repeat the command to continue; stop ends a prune.",
+    "prune": "🧹 @bot /prune <retention> [@user] — every mentioned bot "
+             "redacts its OWN messages older than the retention window, "
+             "or the messages of the one named user "
+             "(@kraken /prune 25 @lucretia). Destructive, so the command "
+             "must name the bot(s) (@kraken /prune 50) and you yourself "
+             "need redact power in this room. Retention: 50 or 50 "
+             "messages = keep the last 50 · 50 days / 2 weeks / 3 months "
+             "/ 1 year / 30 min = keep that span (also min, h, d, w, mo, "
+             "y) · a date = keep from that day: 10.11.2026 or 10.11. "
+             "(European, day first), 11/10/2026 or 11/10 (US, month "
+             "first), 2026-11-10 (ISO). A bare @user is completed with "
+             "this server; @room and @here are not a scope. Long rooms "
+             "are pruned in steps (redaction is rate-limited) — repeat "
+             "the command to continue; stop ends a prune.",
 }
 
 
@@ -1785,28 +1843,40 @@ class MessageWatcher:
     # -- /prune command ---------------------------------------------------------------
 
     PRUNE_USAGE = (
-        "🧹 Usage: @bot /prune <retention> — every named bot redacts its "
-        "own older messages (you need this room's redact power). "
-        "Retention: a count (50), a span (50 days, 2 weeks, 1 year) or a "
-        "date (10.11.2026) — /help prune lists every accepted form.")
+        "🧹 Usage: @bot /prune <retention> [@user] — every named bot "
+        "redacts its own older messages (with @user: that user's "
+        "instead), down to the retention (you need this room's redact "
+        "power). Retention: a count (50), a span (50 days, 2 weeks, "
+        "1 year) or a date (10.11.2026) — /help prune lists every "
+        "accepted form.")
 
     def _prune_room(self, room_id: str, args: str, ev: dict,
                     mentioned: list[str]) -> None:
-        """``@bot /prune <retention>``: the named bot(s) redact their OWN
-        messages older than the retention window (module docstring 2i).
+        """``@bot /prune <retention> [@user]``: the named bot(s) redact
+        their OWN messages older than the retention window — or, when the
+        command names a user too, that user's messages outside it
+        (module docstring 2i).
 
         Destructive, so two gates: the command must name this bot (leading
-        mention or mention pill — an untagged ``/prune`` in a multi-bot
-        room would otherwise let one stray message wipe every bot), and
-        the sender must hold the room's redact power. The walk itself runs
-        as a cancellable room session: 🔧 on the command message, ``stop``
-        ends it, ``/status`` shows it.
+        mention, mention pill or an ``m.mentions`` tag anywhere in it — a
+        scope mention alone does not count, and an untagged ``/prune`` in
+        a multi-bot room would otherwise let one stray message wipe every
+        bot), and the sender must hold the room's redact power (the same
+        power that would let them redact those other messages themselves).
+        The walk itself runs as a cancellable room session: 🔧 on the
+        command message, ``stop`` ends it, ``/status`` shows it.
         """
-        if not (mentioned or extract_mentions(ev)):
+        names = {self.bot.cfg.user.casefold(), self.bot.cfg.name.casefold()}
+        if not (tags_bot_itself(ev, self.bot.user_id)
+                or any(_mention_token_is_me(tok, names) for tok in mentioned)):
             self._send_note(
                 room_id, f"🧹 Destructive, so name the bot(s) to prune: "
                          f"{self.bot.user_id} /prune 50 keeps my last 50 "
                          f"messages — /help prune explains the retention.")
+            return
+        args, target, bad_scope = split_prune_target(args, self.bot.user_id)
+        if bad_scope:
+            self._send_note(room_id, f"🧹 {bad_scope}.")
             return
         spec = parse_prune_spec(args)
         if not spec:
@@ -1826,17 +1896,20 @@ class MessageWatcher:
                             f"power — a prune from you would be refused by "
                             f"the server anyway.")
             return
-        kept, _ = _prune_phrases(spec)
+        kept, _ = _prune_phrases(spec, _prune_owner(target, self.bot.user_id))
         _log(f"{self.tag} /prune {args!r} in {room_id} by {sender} "
-             f"-> walking the history ({kept})")
-        threading.Thread(target=self._prune_run, args=(room_id, spec, ev),
+             f"(scope {target or 'own'}) -> walking the history ({kept})")
+        threading.Thread(target=self._prune_run,
+                         args=(room_id, spec, target, ev),
                          name=f"prune-{self.bot.name}".replace("/", "_"),
                          daemon=True).start()
 
-    def _prune_run(self, room_id: str, spec: tuple, ev: dict) -> None:
+    def _prune_run(self, room_id: str, spec: tuple, target: str | None,
+                   ev: dict) -> None:
         """Background walk started by ``/prune``: page through the history
-        newest→oldest and redact the bot's own messages outside the
-        retention window.
+        newest→oldest and redact the scoped user's messages outside the
+        retention window — the bot's own, or ``target``'s when the command
+        named one.
 
         Rate-limited (429) redactions sit out the server's ``retry_after_ms``
         (``_retry_wait``), so the walk is bounded by page, redaction
@@ -1857,13 +1930,14 @@ class MessageWatcher:
                 sess.reactions.append(rid)
         keep_count = spec[1] if spec[0] == "count" else None
         cutoff_ms = None if keep_count is not None else spec[1] * 1000
-        me = self.bot.user_id.casefold()
+        who = (target or self.bot.user_id).casefold()
+        owner = _prune_owner(target, self.bot.user_id)
         started = time.monotonic()
         deadline = started + PRUNE_TIME_BUDGET_SECONDS
         token: str | None = None
-        own_seen = redacted = failed = 0
+        scoped_seen = redacted = failed = 0
         stop_reason = ""
-        kept_phrase, within_phrase = _prune_phrases(spec)
+        kept_phrase, within_phrase = _prune_phrases(spec, owner)
         last_note_n, last_note_t = 0, started
         try:
             for _page in range(PRUNE_MAX_PAGES):
@@ -1886,7 +1960,7 @@ class MessageWatcher:
                     if not eid or event.get("type") not in (
                             "m.room.message", "m.room.encrypted"):
                         continue
-                    if str(event.get("sender") or "").casefold() != me:
+                    if str(event.get("sender") or "").casefold() != who:
                         continue
                     if (event["type"] == "m.room.message"
                             and not isinstance(
@@ -1894,8 +1968,8 @@ class MessageWatcher:
                                 str)):
                         continue    # already redacted: neither kept nor counted
                     if keep_count is not None:
-                        own_seen += 1
-                        if own_seen <= keep_count:
+                        scoped_seen += 1
+                        if scoped_seen <= keep_count:
                             continue        # one of the kept messages
                     elif (event.get("origin_server_ts") or 0) >= cutoff_ms:
                         continue            # inside the retention window
@@ -1922,9 +1996,10 @@ class MessageWatcher:
                                     >= PRUNE_PROGRESS_SECONDS)):
                             self._prune_note(
                                 room_id,
-                                f"🧹 Prune in progress — {redacted} of my "
-                                f"message(s) redacted so far, {kept_phrase};"
-                                f" still going (stop ends it).", attempts=3)
+                                f"🧹 Prune in progress — {redacted} of "
+                                f"{owner} message(s) redacted so far, "
+                                f"{kept_phrase}; still going (stop ends "
+                                f"it).", attempts=3)
                             last_note_n, last_note_t = redacted, \
                                 time.monotonic()
                     else:
@@ -1948,16 +2023,16 @@ class MessageWatcher:
             note = (f"🧹 Prune stopped — {redacted} message(s) redacted. "
                     f"Run /prune again to continue.")
         elif stop_reason:
-            note = (f"🧹 {redacted} of my message(s) redacted — "
+            note = (f"🧹 {redacted} of {owner} message(s) redacted — "
                     f"{stop_reason}. Run /prune again to continue.")
         elif redacted:
-            note = (f"🧹 {redacted} of my message(s) redacted, "
+            note = (f"🧹 {redacted} of {owner} message(s) redacted, "
                     f"{kept_phrase}.")
         elif failed:
             note = (f"⚠️ /prune: {failed} message(s) could not be redacted "
                     f"(see the service log).")
         else:
-            note = (f"🧹 Nothing to redact — my messages here are "
+            note = (f"🧹 Nothing to redact — {owner} messages here are "
                     f"{within_phrase}.")
         if failed and redacted:
             note += f" ({failed} could not be redacted)"
