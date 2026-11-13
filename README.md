@@ -451,7 +451,10 @@ messages older than the retention window:
   the walk is bounded by page/redaction/time budgets — a huge room simply
   ends in *"run /prune again to continue"*, and since already-redacted
   messages are neither kept nor counted, the next run resumes exactly
-  where this one stopped.
+  where this one stopped. Long walks report progress (a note every ~50
+  redactions, at most every few minutes), so a big room never looks
+  stuck — and the summary note waits out the rate limit the redactions
+  themselves cause instead of vanishing into a 429.
 
 ### Invisible messages (bot echo safety)
 

@@ -76,7 +76,9 @@ bot receives — any channel it is in, including DMs — in this order:
       the retention window (a message count like ``50``, a span like
       ``2 weeks``, or a date like ``10.11.2026`` — see ``/help prune``),
       provided the sender holds the room's redact power.  Runs as a
-      cancellable room session: ``stop`` ends it, 🔧 marks it.
+      cancellable room session: ``stop`` ends it, 🔧 marks it, long walks
+      send 🧹 progress notes (and the summary survives the rate limit the
+      redactions leave behind).
   3. if a client is waiting for a reply in that room (``POST /wait``, or
      the MCP ``wait_for_reply`` tool), the message is handed to the oldest
      waiter instead of running any triggers.  While a trigger run for that
@@ -613,10 +615,11 @@ def sender_may_redact(power_levels: dict, sender: str) -> bool:
         return False
 
 
-def _prune_retry_wait(exc: MatrixError, attempt: int) -> float:
+def _retry_wait(exc: MatrixError, attempt: int) -> float:
     """Seconds to sit out after a 429: the server's ``retry_after_ms``
     when it sent one (capped at 30 s — a run's own time budget bounds how
-    long a rate-limited prune can drag on), else a growing backoff."""
+    long a rate-limited walk can drag on), else a growing backoff.
+    Shared by the ``/prune`` redactions and any room text they send."""
     payload = exc.payload if isinstance(exc.payload, dict) else {}
     try:
         ms = float(payload.get("retry_after_ms") or 0)
@@ -659,6 +662,11 @@ PRUNE_PAGE_LIMIT = 100
 PRUNE_MAX_PAGES = 200
 PRUNE_MAX_REDACTIONS = 5000
 PRUNE_TIME_BUDGET_SECONDS = 600
+
+#: progress notes for long prunes: every N redactions — or after this many
+#: seconds, since a rate-limited walk may redact far slower than N
+PRUNE_PROGRESS_REDACTIONS = 50
+PRUNE_PROGRESS_SECONDS = 180
 
 #: the menu ``/help`` posts into the room (short on purpose — the details
 #: live behind ``/help <command>``)
@@ -1352,10 +1360,18 @@ class MessageWatcher:
             return None
 
     def _unreact(self, room_id: str, reaction_id: str) -> None:
-        try:
-            self.bot.client.unreact(room_id, reaction_id)
-        except MatrixError as exc:
-            _log(f"{self.tag} removing wrench ({reaction_id}) failed: {exc}")
+        # after a /prune the bot's send quota can still be used up — sit
+        # out a 429 instead of leaving the wrench stuck in the room
+        for attempt in range(3):
+            try:
+                self.bot.client.unreact(room_id, reaction_id)
+                return
+            except MatrixError as exc:
+                if exc.status != 429 or attempt == 2:
+                    _log(f"{self.tag} removing wrench ({reaction_id}) "
+                         f"failed: {exc}")
+                    return
+                self._stop.wait(min(_retry_wait(exc, attempt), 10.0))
 
     def _clean_up(self, sess: _Session) -> None:
         """Atomically claim this session's wrench removal (happens exactly once)
@@ -1823,7 +1839,7 @@ class MessageWatcher:
         retention window.
 
         Rate-limited (429) redactions sit out the server's ``retry_after_ms``
-        (``_prune_retry_wait``), so the walk is bounded by page, redaction
+        (``_retry_wait``), so the walk is bounded by page, redaction
         and time budgets — a huge room ends in "run /prune again to
         continue".  Already-redacted events are skipped and NOT counted as
         kept, which is exactly what makes the next run resume where this
@@ -1847,6 +1863,8 @@ class MessageWatcher:
         token: str | None = None
         own_seen = redacted = failed = 0
         stop_reason = ""
+        kept_phrase, within_phrase = _prune_phrases(spec)
+        last_note_n, last_note_t = 0, started
         try:
             for _page in range(PRUNE_MAX_PAGES):
                 if sess.cancelled or self._stop.is_set():
@@ -1897,6 +1915,18 @@ class MessageWatcher:
                                           lambda: (sess.cancelled
                                                    or self._stop.is_set())):
                         redacted += 1
+                        if (redacted - last_note_n
+                                >= PRUNE_PROGRESS_REDACTIONS
+                                or (redacted > last_note_n and
+                                    time.monotonic() - last_note_t
+                                    >= PRUNE_PROGRESS_SECONDS)):
+                            self._prune_note(
+                                room_id,
+                                f"🧹 Prune in progress — {redacted} of my "
+                                f"message(s) redacted so far, {kept_phrase};"
+                                f" still going (stop ends it).", attempts=3)
+                            last_note_n, last_note_t = redacted, \
+                                time.monotonic()
                     else:
                         failed += 1
                 if stop_reason:
@@ -1911,7 +1941,6 @@ class MessageWatcher:
         except Exception as exc:  # noqa: BLE001 - the note below must go out
             _log(f"{tag} unexpected error: {exc!r}")
             stop_reason = f"the walk crashed ({exc!r})"
-        kept_phrase, within_phrase = _prune_phrases(spec)
         _log(f"{tag} {room_id}: {redacted} redacted, {failed} failed in "
              f"{time.monotonic() - started:.0f}s "
              f"({stop_reason or 'complete'})")
@@ -1932,7 +1961,7 @@ class MessageWatcher:
                     f"{within_phrase}.")
         if failed and redacted:
             note += f" ({failed} could not be redacted)"
-        self._send_note(room_id, note)
+        self._prune_note(room_id, note)
         with self._session_lock:
             live = self._sessions.get(key)
             if live and sess in live:
@@ -1959,18 +1988,36 @@ class MessageWatcher:
                 if exc.status == 404:
                     return True         # already gone: counts as redacted
                 if exc.status == 429 and attempt < 3:
-                    self._stop.wait(_prune_retry_wait(exc, attempt))
+                    self._stop.wait(_retry_wait(exc, attempt))
                     continue
                 _log(f"{tag} redacting {event_id} failed: {exc}")
                 return False
             except OSError as exc:      # requests' network errors are OSErrors
                 if attempt < 3:
-                    self._stop.wait(_prune_retry_wait(
+                    self._stop.wait(_retry_wait(
                         MatrixError(0, "network"), attempt))
                     continue
                 _log(f"{tag} redacting {event_id} failed: {exc}")
                 return False
         return False
+
+    def _prune_note(self, room_id: str, message: str,
+                    attempts: int = 5) -> None:
+        """A room note that survives the rate limit a long prune leaves
+        behind: a plain ``_send_note`` right after hundreds of redactions
+        is reliably a 429, and a prune whose summary vanishes looks
+        exactly like a hang."""
+        for attempt in range(attempts):
+            try:
+                self.bot.client.send_message(
+                    room_id, {"msgtype": "m.text",
+                              "body": META_MARK + message})
+                return
+            except MatrixError as exc:
+                if exc.status != 429 or attempt == attempts - 1:
+                    _log(f"{self.tag} sending the prune note failed: {exc}")
+                    return
+                self._stop.wait(_retry_wait(exc, attempt))
 
     # -- run outcome --------------------------------------------------------------
 
