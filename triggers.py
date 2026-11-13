@@ -34,7 +34,7 @@ bot receives — any channel it is in, including DMs — in this order:
       act, the others stay silent; no minutes = permanent mute),
       ``/mute 0`` or ``/unmute [@bot]`` ends it.  A muted bot ignores
       everything from here on (triggers, waiters, ``/effort``, ``/btw``,
-      ``/new``, ``/retry``) except ``stop``, ``/help``, ``/status``,
+      ``/new``, ``/revert``) except ``stop``, ``/help``, ``/status``,
       ``/mute`` and ``/unmute``.  Mutes are persisted in the bot's
       state dir.
   2c. ``/effort`` (list the reasoning-effort levels of the room) and
@@ -48,8 +48,9 @@ bot receives — any channel it is in, including DMs — in this order:
       session (see 4): ``/end`` and ``/new`` without text only ack (the
       next message starts fresh), ``/new <text>`` immediately runs the
       text as a prompt in a fresh session.
-  2f. ``/retry`` re-fires the room's last trigger message — always in
-      a fresh session (the live one is closed first).
+  2f. ``/revert [text]`` re-fires the room's last trigger message — always
+      in a fresh session (the live one is closed first); with text, the
+      trigger runs on that updated message instead of the original one.
   2g. mention gate: a message that *tags* someone explicitly (an
       ``m.mentions`` pill, or a plain ``@user:server`` in the text) is
       meant for that person — the bot stays completely silent unless it is
@@ -85,7 +86,7 @@ bot receives — any channel it is in, including DMs — in this order:
      admitted to that session as a continuation prompt (``{{msg}}`` then
      carries only the new message — the session already knows the rest),
      and only after the window closes (or after ``/new``/``/end``/
-     ``/retry``) does the next message start a fresh session.  An unused,
+     ``/revert``) does the next message start a fresh session.  An unused,
      expired session is deleted by a sweep on every sync round.
 
 Wrench feedback (🔧):
@@ -272,6 +273,8 @@ def parse_btw_command(body: str | None) -> tuple[bool, str]:
 
 
 _NEW_RE = re.compile(r"^/new\b[\s,]*(.*)$", re.IGNORECASE | re.DOTALL)
+_REVERT_RE = re.compile(r"^/(?:revert|retry)\b[\s,]*(.*)$",
+                        re.IGNORECASE | re.DOTALL)
 _MUTE_RE = re.compile(r"^/mute\b[\s,]*(.*)$", re.IGNORECASE | re.DOTALL)
 _UNMUTE_RE = re.compile(r"^/unmute\b[\s,]*(.*)$", re.IGNORECASE | re.DOTALL)
 
@@ -315,7 +318,7 @@ def _mention_token_is_me(token: str, names: set[str]) -> bool:
 #: command names ``_looks_like_command`` recognizes (keep in sync with the
 #: parsers the pipeline runs before the mention gates)
 _COMMAND_NAMES = {"help", "status", "mute", "unmute", "effort", "btw",
-                  "new", "end", "retry"}
+                  "new", "end", "revert", "retry"}
 
 
 def _looks_like_command(body: str | None) -> bool:
@@ -360,9 +363,17 @@ def parse_end_command(body: str | None) -> bool:
     return _parse_bare(body, "end")
 
 
-def parse_retry_command(body: str | None) -> bool:
-    """True for a bare ``/retry`` (re-fires the last trigger message)."""
-    return _parse_bare(body, "retry")
+def parse_revert_command(body: str | None) -> tuple[bool, str]:
+    """True for ``/revert`` or ``/revert <text>`` — re-run the room's last
+    trigger message in a fresh session; the text (if any) replaces the
+    original message.  ``/retry`` is accepted as a hidden alias.
+    """
+    if not body:
+        return False, ""
+    m = _REVERT_RE.match(body.strip())
+    if m is None:
+        return False, ""
+    return True, m.group(1).strip()
 
 
 def parse_status_command(body: str | None) -> bool:
@@ -421,7 +432,7 @@ META_MARK = "\u200c"
 #: how long a room's live OpenCode session stays open after a finished run:
 #: the next message of the room within this window continues the session
 #: (every run re-arms the window), afterwards — or after ``/new``, ``/end``,
-#: ``/retry`` — the next message starts a fresh one
+#: ``/revert`` — the next message starts a fresh one
 SESSION_WINDOW_SECONDS = 120 * 60
 
 #: timeout for command-started runs that have no action behind them
@@ -444,7 +455,8 @@ HELP_TEXT = (
     f"• /new [text] / /end — close this room's session (it stays open "
     f"{SESSION_WINDOW_SECONDS // 60} min between messages); /new <text> "
     "starts a fresh run right away\n"
-    "• /retry — re-run the last trigger message in a fresh session\n"
+    "• /revert [text] — re-run this room's last trigger message in a fresh "
+    "session; with text, on the updated message instead\n"
     "• /mute [@bot] [minutes] — mute this bot here (no minutes = "
     "permanent); /mute 0 or /unmute unmutes\n"
     f"Any message within {SESSION_WINDOW_SECONDS // 60} min of the last "
@@ -618,7 +630,7 @@ class MessageWatcher:
         #: within the window continues it, afterwards it is deleted.
         #: Persisted so a restart neither forgets nor double-deletes.
         self._room_sessions: dict[str, dict] = {}
-        #: last fired trigger per room for ``/retry`` (casefolded room_id ->
+        #: last fired trigger per room for ``/revert`` (casefolded room_id ->
         #: {"trigger": <Trigger.room name>, "ev": <compact event>})
         self._fired: dict[str, dict] = {}
         self._room_session_file = (
@@ -721,7 +733,7 @@ class MessageWatcher:
 
     def _close_session(self, room_id: str) -> dict | None:
         """Drop the room's live session for good (``/new``, ``/end``,
-        ``/retry``): managed sessions are deleted, ``keep_session`` ones
+        ``/revert``): managed sessions are deleted, ``keep_session`` ones
         are only un-remembered (the webhooker never deletes them)."""
         entry = self._claim_session(room_id)
         if entry and entry.get("managed"):
@@ -1429,17 +1441,21 @@ class MessageWatcher:
             self._clean_up(sess)
             _log(f"{tag} /new run finished for {room_id}")
 
-    # -- /retry command ---------------------------------------------------------------
+    # -- /revert command --------------------------------------------------------------
 
-    def _retry_room(self, room_id: str, room_name: str | None) -> None:
-        """``/retry``: re-fire the room's last trigger message — always in
-        a fresh session (the live one is closed first)."""
+    def _revert_room(self, room_id: str, room_name: str | None,
+                     text: str) -> None:
+        """``/revert [text]``: revert to the room's last trigger message and
+        re-fire it — always in a fresh session (the live one is closed
+        first).  With text, that text *replaces* the recorded message: the
+        trigger retries on the updated text while sender and room stay as
+        they were."""
         key = room_id.casefold()
         with self._session_lock:
             entry = dict(self._fired.get(key) or {})
         if not entry.get("ev"):
-            self._send_note(room_id, "🔁 Nothing to retry — this room has no "
-                                      "recorded trigger message yet.")
+            self._send_note(room_id, "↩️ Nothing to revert to — this room "
+                                      "has no recorded trigger message yet.")
             return
         trig = next((t for t in self.bot.cfg.triggers
                      if t.room == entry.get("trigger")), None)
@@ -1447,15 +1463,18 @@ class MessageWatcher:
             trig = next((t for t in self.bot.cfg.triggers
                          if t.matches(room_id, room_name)), None)
         if trig is None:
-            self._send_note(room_id, "🔁 The trigger that produced the last "
+            self._send_note(room_id, "↩️ The trigger that produced the last "
                                       "message is gone from bots.json.")
             return
         self._close_session(room_id)          # force a fresh session
         ev = dict(entry["ev"])
         ev.setdefault("room_name", room_name)
-        _log(f"{self.tag} /retry in {room_id} -> re-firing {trig.room!r}")
+        if text:
+            ev["body"] = text                 # _run_action renders the event
+        _log(f"{self.tag} /revert{' (edited)' if text else ''} in {room_id}"
+             f" -> re-firing {trig.room!r}")
         threading.Thread(target=self._fire, args=(trig, ev),
-                         name=f"retry-{self.bot.name}".replace("/", "_"),
+                         name=f"revert-{self.bot.name}".replace("/", "_"),
                          daemon=True).start()
 
     # -- run outcome --------------------------------------------------------------
@@ -1586,8 +1605,9 @@ class MessageWatcher:
             self._new_room(room_id, new_text, ev)
             return
 
-        if parse_retry_command(cmd_body):
-            self._retry_room(room_id, room_name)
+        is_revert, revert_text = parse_revert_command(cmd_body)
+        if is_revert:
+            self._revert_room(room_id, room_name, revert_text)
             return
 
         if not addressed_to_bot(ev, self.bot.user_id):
@@ -1635,7 +1655,7 @@ class MessageWatcher:
         room_id = ev["room_id"]
         key = room_id.casefold()
 
-        # remember for /retry: compact copy of what a re-fire needs
+        # remember for /revert: compact copy of what a re-fire needs
         with self._session_lock:
             self._fired[key] = {
                 "trigger": trig.room,
@@ -1712,6 +1732,13 @@ class MessageWatcher:
                 # context.
                 history = [*history, ev]
                 history = history[-trig.context:]
+            # A re-fired message (/revert) can carry updated text — render
+            # the event being handled, not its stale original line.
+            history = [dict(m, body=ev["body"])
+                       if (m.get("event_id") == ev.get("event_id")
+                           and m.get("body") != ev.get("body"))
+                       else m
+                       for m in history]
             values = {
                 "channel": room_name or room_id,
                 "room": room_id,

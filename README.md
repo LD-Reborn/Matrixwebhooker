@@ -237,7 +237,7 @@ literal `@user:server` in the text; quoted reply fallback lines
 (`> <@user:server> …`) do not count as a tag. The gate covers the whole
 pipeline — no trigger fires and a message is not handed to a waiting
 client either. Commands (`stop`, `/help`, `/status`, `/effort`, `/btw`,
-`/new`, `/end`, `/retry`, `/mute`, `/unmute`) are unaffected, and
+`/new`, `/end`, `/revert`, `/mute`, `/unmute`) are unaffected, and
 the bot's own messages are skipped anyway.
 
 **Bot ↔ bot silence.** Two agents that each answer every untagged room
@@ -366,7 +366,7 @@ plain "btw …" in chat, which stays a normal message, the `/` is required.)
 | `/btw <text>` | interject into the action currently running here |
 | `/new [text]` | close the room's session; with text, start a fresh run right away |
 | `/end` | close the room's session (ack only — next message is fresh) |
-| `/retry` | re-run the last trigger message in a fresh session |
+| `/revert [text]` | re-run this room's last trigger message in a fresh session — with `text`, on the updated message instead |
 | `/mute [@bot] [minutes]` | mute this bot here (no minutes = permanent; `/mute 0` unmutes) |
 | `/unmute [@bot]` | end the mute |
 
@@ -385,7 +385,7 @@ message is anything that would fire the room's trigger) is admitted to that
 same session as a continuation — the model still has the whole previous run
 in context — and re-arms the window, so an ongoing back-and-forth keeps
 using one session. Only after the window closes (or after `/new`, `/end`
-or `/retry`) does the next message start a fresh session.
+or `/revert`) does the next message start a fresh session.
 
 - On a continuation the prompt's `{{msg}}` carries **only the new message**
   (the session already knows the rest); a fresh run gets the full
@@ -393,8 +393,10 @@ or `/retry`) does the next message start a fresh session.
 - An unused, expired session is deleted by a sweep on every sync round.
 - `/new <text>` and `/end` close the live session immediately; `/new <text>`
   then runs the text as a prompt in a brand-new session (using the room's
-  trigger action, so its persona/placeholders still apply). `/retry` closes
-  the live session and re-fires the room's last trigger message fresh.
+  trigger action, so its persona/placeholders still apply). `/revert`
+  closes the live session and re-fires the room's last trigger message
+  fresh — with a text, the trigger retries on the **updated message**
+  (the recorded original line in `{{msg}}` history is replaced by it).
 - Only *succeeded* runs become the live session; a *failed* run keeps its
   session for TUI inspection as usual, and timeouts / `stop` delete it.
   Sessions of `keep_session` actions stay the live session but are never
@@ -405,7 +407,7 @@ or `/retry`) does the next message start a fresh session.
 ### Muting a bot (`/mute`, `/unmute`)
 
 `/mute [@bot] [minutes]` mutes the bot in that room — it then ignores
-everything (triggers, waits, `/effort`, `/btw`, `/new`, `/retry`) except
+everything (triggers, waits, `/effort`, `/btw`, `/new`, `/revert`) except
 `stop`, `/help`, `/status`, `/mute` and `/unmute`. Omit the minutes for a
 **permanent** mute; `/mute 0` or `/unmute` ends it. With an `@name`, only
 the bot it matches acts and the others ignore the command silently, so
