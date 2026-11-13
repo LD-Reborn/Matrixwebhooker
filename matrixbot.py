@@ -1011,6 +1011,61 @@ class EffortStore:
                   file=sys.stderr)
 
 
+class MuteStore:
+    """Per-room mute set (``/mute`` / ``/unmute``).
+
+    Maps room id (casefolded) to its expiry epoch; a ``None`` expiry in the
+    persisted file means *permanent* mute (set by ``/mute`` without a time,
+    ended only by ``/mute 0`` or ``/unmute``).  Persisted in the bot's state
+    dir so a restart keeps every mute.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._mutes: dict[str, float] = {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if v is None:                  # permanent
+                        self._mutes[str(k).casefold()] = float("inf")
+                    else:
+                        self._mutes[str(k).casefold()] = float(v)
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def expiry(self, room_id: str) -> float | None:
+        """``None`` = not muted; ``float("inf")`` = permanent; else epoch."""
+        key = room_id.casefold()
+        with self._lock:
+            exp = self._mutes.get(key)
+        if exp is None or exp > time.time():
+            return exp
+        self.set(room_id, 0)                       # timed-out: forget lazily
+        return None
+
+    def set(self, room_id: str, seconds: float | None) -> None:
+        """``None`` seconds = permanent mute, ``<= 0`` = unmute,
+        otherwise mute for that many seconds."""
+        key = room_id.casefold()
+        with self._lock:
+            if seconds is None:
+                self._mutes[key] = float("inf")
+            elif seconds <= 0:
+                self._mutes.pop(key, None)
+            else:
+                self._mutes[key] = time.time() + seconds
+            snapshot = dict(self._mutes)
+        try:
+            data = {k: (None if v == float("inf") else v)
+                    for k, v in snapshot.items()}
+            self._path.write_text(
+                json.dumps(data, indent=1, sort_keys=True), encoding="utf-8")
+        except OSError as exc:
+            print(f"[mute] saving {self._path} failed: {exc}", file=sys.stderr)
+
+
 class Bot:
     def __init__(self, cfg: BotConfig, settings: Settings):
         self.cfg = cfg
@@ -1020,6 +1075,8 @@ class Bot:
         self.client = Matrix(settings.homeserver, cfg.user, cfg.password, state_dir)
         #: per-room /effort overrides (room id -> OpenCode model variant)
         self.effort = EffortStore(state_dir / "effort.json")
+        #: per-room /mute state (expiry epoch, None = permanent)
+        self.mute = MuteStore(state_dir / "mute.json")
         self._crypto: BotCrypto | None = None
         self._opencode: OpenCodeClient | None = None
         #: set by server.py when the bot has "call" enabled (calls.CallManager)

@@ -11,6 +11,9 @@ bots.json.bak*
 */crypto/
 */key_pending.json
 */effort.json
+*/room_sessions.json
+*/last_session.json
+*/mute.json
 */voice-cache/
 .trigger-context/
 __pycache__/

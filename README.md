@@ -131,8 +131,10 @@ Per action the server gets a **fresh session per message**: create
 (`POST /api/session` with model/agent/location), attach the system prompt
 (instruction entry), send the prompt, poll until the session is idle, take
 the final assistant text. Tool use runs headless (the default config asks
-no permission questions). Sessions are deleted after a successful run; a
-*failed* run keeps its session so you can inspect the turn in the TUI.
+no permission questions). A succeeded run's session stays open as the
+room's live conversation (see
+[`Room sessions`](#room-sessions-auto-continue)); a *failed* run keeps its
+session so you can inspect the turn in the TUI.
 
 ## Triggers (incoming messages)
 
@@ -201,7 +203,8 @@ triggers reference (and can override field by field):
     `wait_for_reply`, `read_messages`, …)
   - `timeout` — seconds to wait for the answer (default 300)
   - `keep_session` — keep the session after a *successful* run too
-    (default false)
+    (default false). Such sessions are never deleted by the webhooker;
+    they still become the room's live session (see *Room sessions*).
 - `context` — how many messages `{{msg}}` holds (default `25`, max `100`).
 - **The answer is posted by the webhooker itself** — the final assistant
   text becomes a room message. The agent can *additionally* use the matrix
@@ -233,7 +236,8 @@ therefore reacts once **it is tagged too** — alone or among others:
 literal `@user:server` in the text; quoted reply fallback lines
 (`> <@user:server> …`) do not count as a tag. The gate covers the whole
 pipeline — no trigger fires and a message is not handed to a waiting
-client either. Commands (`stop`, `/effort`, `/btw`) are unaffected, and
+client either. Commands (`stop`, `/help`, `/status`, `/effort`, `/btw`,
+`/new`, `/end`, `/retry`, `/mute`, `/unmute`) are unaffected, and
 the bot's own messages are skipped anyway.
 
 **Bot ↔ bot silence.** Two agents that each answer every untagged room
@@ -348,6 +352,79 @@ client), the text is admitted to the running OpenCode session as a `steer`
 prompt, so the model sees it mid-turn. If nothing is running the bot says
 so; the message gets the usual 🔧 while it is being handed over. (Unlike a
 plain "btw …" in chat, which stays a normal message, the `/` is required.)
+
+### Commands (`/help`)
+
+`/help` posts the command menu into the room:
+
+| command | what it does |
+|---|---|
+| `stop` | interrupt the action running in this room (acked by reaction) |
+| `/help` | this menu |
+| `/status` | what the bot is doing right now (thinking / running a tool / writing) + session, effort, mute |
+| `/effort [default\|low\|mid\|high\|xhigh]` | show / set the reasoning effort for this room |
+| `/btw <text>` | interject into the action currently running here |
+| `/new [text]` | close the room's session; with text, start a fresh run right away |
+| `/end` | close the room's session (ack only — next message is fresh) |
+| `/retry` | re-run the last trigger message in a fresh session |
+| `/mute [@bot] [minutes]` | mute this bot here (no minutes = permanent; `/mute 0` unmutes) |
+| `/unmute [@bot]` | end the mute |
+
+As with every command here: the leading `/` is required, the message must
+be the command — or the command **behind leading mentions**, so in a group
+chat `@kraken /status` or `@bot1 @bot2 stop` addresses only the tagged
+bots and the others stay silent (case and trailing punctuation are
+ignored). Commands work regardless of the mention gates. `stop`, `/help`
+and `/status` also work while the room is muted.
+
+### Room sessions (auto-continue)
+
+A **succeeded** run leaves its OpenCode session open as the room's *live
+conversation*. The next message of that room within **120 minutes** (a
+message is anything that would fire the room's trigger) is admitted to that
+same session as a continuation — the model still has the whole previous run
+in context — and re-arms the window, so an ongoing back-and-forth keeps
+using one session. Only after the window closes (or after `/new`, `/end`
+or `/retry`) does the next message start a fresh session.
+
+- On a continuation the prompt's `{{msg}}` carries **only the new message**
+  (the session already knows the rest); a fresh run gets the full
+  `context` history as before.
+- An unused, expired session is deleted by a sweep on every sync round.
+- `/new <text>` and `/end` close the live session immediately; `/new <text>`
+  then runs the text as a prompt in a brand-new session (using the room's
+  trigger action, so its persona/placeholders still apply). `/retry` closes
+  the live session and re-fires the room's last trigger message fresh.
+- Only *succeeded* runs become the live session; a *failed* run keeps its
+  session for TUI inspection as usual, and timeouts / `stop` delete it.
+  Sessions of `keep_session` actions stay the live session but are never
+  deleted by the webhooker.
+- A room's live session and its `/mute` state survive a restart (bot state
+  dir, `room_sessions.json` / `mute.json`).
+
+### Muting a bot (`/mute`, `/unmute`)
+
+`/mute [@bot] [minutes]` mutes the bot in that room — it then ignores
+everything (triggers, waits, `/effort`, `/btw`, `/new`, `/retry`) except
+`stop`, `/help`, `/status`, `/mute` and `/unmute`. Omit the minutes for a
+**permanent** mute; `/mute 0` or `/unmute` ends it. With an `@name`, only
+the bot it matches acts and the others ignore the command silently, so
+`/mute @kraken 15` in a shared room mutes just kraken — and without an
+`@name` every bot mutes *itself*, so `/mute 15` mutes all. Word order is
+free (`/mute 15 @bot` too), and the leading-mention form
+`@kraken @lucretia-pc /mute 15` addresses the command to those bots.
+Mutes persist across restarts.
+
+### Invisible messages (bot echo safety)
+
+A message whose body **starts with a zero-width character** (`U+200C` or
+`U+FEFF`) is completely ignored by the bots — no trigger, no command, no
+reaction, not handed to a waiting model. The bot prefixes every status text
+it posts (`/help`, `/status`, acks, ⚠️/⏳/🤔 notices) with `U+200C`, so two
+bots in one room never answer each other's notices even if `peer_bots` is
+not configured on every host. Real model answers are never marked. (Both
+characters were confirmed to survive the Matrix wire untouched and to
+render as nothing.)
 
 ## Voice calls (MatrixRTC / Element Call)
 

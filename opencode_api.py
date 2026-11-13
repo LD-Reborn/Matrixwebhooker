@@ -23,9 +23,16 @@ Flow per action (verified against opencode v2.1.4):
   5. ``POST /api/session/<id>/interrupt`` stops a running turn (the room's
      bare ``stop``), ``DELETE /api/session/<id>`` cleans up.
 
-Sessions are deleted after a run (fresh per message); a *failed* run keeps
-its session so the turn can still be inspected in the OpenCode TUI
-(``keep_session`` keeps them always).
+Sessions are not disposable by default: a *succeeded* run's session stays
+open as the room's live conversation — ``continue_session`` admits the next
+prompt to it (the watcher does this automatically while the room's session
+window is open, see ``SESSION_WINDOW_SECONDS`` in ``triggers.py``) and waits
+for the answer exactly like ``run``.  Otherwise the old rules hold: a
+*failed* run keeps its session for inspection in the OpenCode TUI,
+``keep_session`` keeps sessions always.  The webhooker's watcher manages
+session lifetimes (delete after timeout/interrupt, close via ``/new``,
+``/end`` or window expiry), so it always calls with ``keep_session=True``
+and deletes according to the outcome.
 """
 
 from __future__ import annotations
@@ -200,6 +207,49 @@ class OpenCodeClient:
         except OpenCodeError:
             pass
 
+    def session_activity(self, session_id: str) -> str:
+        """One-shot snapshot of what a running session is doing (``/status``).
+
+        Reads the message list once and classifies the newest assistant
+        turn: ``thinking`` (no output yet / last step was a finished tool
+        call), ``running tool <name> — awaiting its result`` (an unfinished
+        tool part), ``writing the answer`` (streaming text) or ``idle``.
+        Unreachable sessions answer ``unknown`` — this must never raise.
+        """
+        try:
+            messages = self._req(
+                "GET", f"/api/session/{session_id}/message").get("data") or []
+        except OpenCodeError:
+            return "unknown"
+        for m in messages:                       # newest first
+            if m.get("type") == "idle":
+                return "idle"
+        assistant = next((m for m in messages
+                          if m.get("type") == "assistant"), None)
+        parts = [p for p in ((assistant or {}).get("content") or [])
+                 if isinstance(p, dict)]
+        if not parts:
+            return "thinking"
+        last = parts[-1]
+        ptype = str(last.get("type") or "").casefold()
+        if "tool" in ptype:
+            done = ("result" in ptype
+                    or last.get("result") is not None
+                    or last.get("output") is not None
+                    or str(last.get("status") or "").casefold()
+                    in ("completed", "complete", "done", "success", "error"))
+            if done:
+                return "thinking"
+            name = str(last.get("toolName") or last.get("name")
+                       or last.get("tool") or "").strip()
+            if len(name) > 30:
+                name = name[:30] + "…"
+            return f"running tool {name} — awaiting its result" if name \
+                else "awaiting a tool result"
+        if ptype == "text" and str(last.get("text") or "").strip():
+            return "writing the answer"
+        return "thinking"
+
     # -- the orchestrated run -----------------------------------------------------
 
     def run(self, *, title: str, prompt: str, system: str = "", model: str = "",
@@ -225,7 +275,47 @@ class OpenCodeClient:
             if system:
                 self.set_system_prompt(result.session_id, system)
             self.send_prompt(result.session_id, prompt)
+        except OpenCodeError as exc:
+            result.outcome = "error"
+            result.error = str(exc)
+            return result
+        except ValueError as exc:            # bad model spec etc.
+            result.outcome = "error"
+            result.error = str(exc)
+            return result
+        return self._await_turn(result, timeout, cancel, keep_session, log)
 
+    def continue_session(self, session_id: str, *, prompt: str,
+                         timeout: float = 300.0, cancel=None,
+                         keep_session: bool = False, log=None) -> ActionResult:
+        """Send another prompt to an *existing* session (the room's live
+        conversation) and wait for the answer exactly like ``run``.
+
+        No session is created and no system prompt attached — only the
+        prompt is admitted to the kept session.  An unreachable / already
+        deleted session answers as ``outcome="error"``.  Session lifetime
+        follows the same rules as ``run`` (see ``_await_turn``).
+        """
+        log = log or (lambda m: print(m, file=sys.stderr, flush=True))
+        result = ActionResult(session_id=session_id)
+        try:
+            self.send_prompt(session_id, prompt)
+        except OpenCodeError as exc:
+            result.outcome = "error"
+            result.error = str(exc)
+            return result
+        return self._await_turn(result, timeout, cancel, keep_session, log)
+
+    def _await_turn(self, result: ActionResult, timeout: float, cancel,
+                    keep_session: bool, log) -> ActionResult:
+        """Poll ``result``'s session until the turn ends; fills in the
+        result's ``outcome``/``text``/``error``.
+
+        Afterwards the session is deleted unless it *failed* (kept for
+        inspection in the TUI) or ``keep_session`` was set — the caller
+        takes over lifetime management then (see the module docstring).
+        """
+        try:
             seen_perms: set = set()
             deadline = time.monotonic() + timeout
             while True:
@@ -264,10 +354,6 @@ class OpenCodeClient:
                         break
                 return result
         except OpenCodeError as exc:
-            result.outcome = "error"
-            result.error = str(exc)
-            return result
-        except ValueError as exc:            # bad model spec etc.
             result.outcome = "error"
             result.error = str(exc)
             return result

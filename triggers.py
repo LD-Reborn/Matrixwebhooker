@@ -6,6 +6,15 @@ thread per bot long-polls Matrix ``/sync`` and, for every room message the
 bot receives — any channel it is in, including DMs — in this order:
 
   1. messages sent by the bot itself are ignored (never a trigger);
+  1b. invisible-to-bots marker: a message whose body *starts* with a
+      zero-width character (U+200C ZWNJ or U+FEFF BOM — both verified to
+      survive the Matrix wire untouched and to render invisibly) is
+      completely ignored: no trigger, no command, no waiter, no reaction.
+      Every meta text the bot posts itself (``/help``, ``/status``, acks,
+      failure notices — everything via ``_send_note``) carries the U+200C
+      prefix, so peer bots never echo each other, independent of whether
+      ``peer_bots`` is configured on every deployment.  Real model answers
+      are never marked.
   2. a bare "stop" keyword (``stop`` / ``/stop`` / ``STOP`` / ``STOP!!!`` —
      starts with "stop" and contains no whitespace) halts the current
      execution for that room: every OpenCode session the running trigger
@@ -15,21 +24,43 @@ bot receives — any channel it is in, including DMs — in this order:
      delivered to a waiter or fired as a trigger.  It is acked by *reacting*
      to the stop message (🛑 something stopped / ⭕ nothing was running) —
      a text ack would re-trigger other bots in multi-bot rooms (echo loops).
-  2b. ``/effort`` (list the reasoning-effort levels of the room) and
+  2a. ``/help`` posts the command menu; ``/status`` reports the live
+      activity of every run in flight (thinking / running a tool /
+      writing the answer — see ``opencode_api.session_activity``) plus
+      the room's session, effort and mute state.  Both always work,
+      also when muted.
+  2b. ``/mute [@bot] [minutes]`` mutes this bot in this room (a
+      ``@name`` targeting another user only makes the bot it matches
+      act, the others stay silent; no minutes = permanent mute),
+      ``/mute 0`` or ``/unmute [@bot]`` ends it.  A muted bot ignores
+      everything from here on (triggers, waiters, ``/effort``, ``/btw``,
+      ``/new``, ``/retry``) except ``stop``, ``/help``, ``/status``,
+      ``/mute`` and ``/unmute``.  Mutes are persisted in the bot's
+      state dir.
+  2c. ``/effort`` (list the reasoning-effort levels of the room) and
       ``/effort <default|low|mid|high|xhigh>`` (set it for the room, persisted
       in the bot's state dir) — the room's level becomes the model
       ``variant`` of every action run started in that room afterwards.
-  2c. ``/btw <text>`` interjects into the action(s) currently running for
+  2d. ``/btw <text>`` interjects into the action(s) currently running for
       that room (OpenCode inbox ``steer`` delivery) instead of starting a
       new run or feeding a waiter.
-  2d. mention gate: a message that *tags* someone explicitly (an
+  2e. ``/new [text]`` and a bare ``/end`` close the room's live OpenCode
+      session (see 4): ``/end`` and ``/new`` without text only ack (the
+      next message starts fresh), ``/new <text>`` immediately runs the
+      text as a prompt in a fresh session.
+  2f. ``/retry`` re-fires the room's last trigger message — always in
+      a fresh session (the live one is closed first).
+  2g. mention gate: a message that *tags* someone explicitly (an
       ``m.mentions`` pill, or a plain ``@user:server`` in the text) is
       meant for that person — the bot stays completely silent unless it is
       tagged **too** (alone or among others; ``@room``/``@here`` tag it as
       well). Messages that tag nobody are for everyone and handled as
       before. This keeps one bot from answering messages another bot (or
-      human) was addressed with.
-  2e. sibling-bot gate: messages from the roster's *other* bots (the bot
+      human) was addressed with.  Commands are addressable the same way:
+      a message that *starts* with mentions is parsed as a command behind
+      them (``@bot /status``, ``@bot stop``) and only runs on the tagged
+      bots — the others stay silent instead of answering it as chat.
+  2h. sibling-bot gate: messages from the roster's *other* bots (the bot
       users in ``bots.json``, plus foreign webhookers' bots listed in the
       top-level ``peer_bots``) only fire triggers when this bot is tagged
       explicitly — untagged bot chatter is ignored, so two agents cannot
@@ -44,10 +75,18 @@ bot receives — any channel it is in, including DMs — in this order:
      with the wrench reaction (see below);
   4. otherwise every trigger of the bot whose room matches is fired in a
      background thread: its ``action`` runs on the OpenCode server
-     (``opencode_api.py``) — a fresh session per message with the
-     ``{{channel}}``, ``{{msg}}`` (last ``context`` messages, newest last),
-     ``{{sender}}`` and ``{{room}}`` placeholders substituted into the
-     prompt — and the final assistant text is posted back into the room.
+     (``opencode_api.py``) with the ``{{channel}}``, ``{{msg}}`` (last
+     ``context`` messages, newest last), ``{{sender}}`` and ``{{room}}``
+     placeholders substituted into the prompt — and the final assistant
+     text is posted back into the room.
+     *Room sessions*: a succeeded run's session stays open as the room's
+     live conversation; the next message of that room within
+     ``SESSION_WINDOW_SECONDS`` (120 min, re-armed by every run) is
+     admitted to that session as a continuation prompt (``{{msg}}`` then
+     carries only the new message — the session already knows the rest),
+     and only after the window closes (or after ``/new``/``/end``/
+     ``/retry``) does the next message start a fresh session.  An unused,
+     expired session is deleted by a sweep on every sync round.
 
 Wrench feedback (🔧):
     Whenever a message is *handled* — a trigger for its room is fired, or it
@@ -232,6 +271,190 @@ def parse_btw_command(body: str | None) -> tuple[bool, str]:
     return True, m.group(1).strip()
 
 
+_NEW_RE = re.compile(r"^/new\b[\s,]*(.*)$", re.IGNORECASE | re.DOTALL)
+_MUTE_RE = re.compile(r"^/mute\b[\s,]*(.*)$", re.IGNORECASE | re.DOTALL)
+_UNMUTE_RE = re.compile(r"^/unmute\b[\s,]*(.*)$", re.IGNORECASE | re.DOTALL)
+
+
+#: ``@user[:domain]`` / ``@room`` / ``@here`` tokens at the very start of a
+#: message — they may introduce a command addressed to one bot
+#: ("@kraken /status"), in which case only the tagged bots act
+_CMD_MENTION_RE = re.compile(
+    r"^(@[A-Za-z0-9._=/+-]+(?::[A-Za-z0-9.-]+)?)[\s,]+")
+
+
+def strip_leading_mentions(body: str | None) -> tuple[str | None, list[str]]:
+    """Peel leading ``@user[:domain]`` tokens (plus whitespace) off a body:
+    ``(remaining, mentioned)``.
+
+    Lets ``@bot /status`` or ``@bot stop`` address a command to a single
+    bot in a group chat: the command then parses against the remainder and
+    only the tagged bots act — the others stay silent.  Messages without a
+    leading mention come back untouched (``mentioned`` empty).
+    """
+    if not body:
+        return body, []
+    text = body
+    mentioned: list[str] = []
+    while True:
+        m = _CMD_MENTION_RE.match(text)
+        if m is None:
+            return text, mentioned
+        mentioned.append(m.group(1))
+        text = text[m.end():]
+
+
+def _mention_token_is_me(token: str, names: set[str]) -> bool:
+    """True when a leading ``@name`` / ``@user:domain`` token names this
+    bot (local part compared, domain ignored) or broadcasts (``@room``,
+    ``@here``)."""
+    t = token.casefold().lstrip("@")
+    return t in ("room", "here") or t.split(":", 1)[0] in names
+
+
+#: command names ``_looks_like_command`` recognizes (keep in sync with the
+#: parsers the pipeline runs before the mention gates)
+_COMMAND_NAMES = {"help", "status", "mute", "unmute", "effort", "btw",
+                  "new", "end", "retry"}
+
+
+def _looks_like_command(body: str | None) -> bool:
+    """True when the body is one of the bot commands — used to recognize a
+    command addressed to *another* bot and stay silent instead of answering
+    it as ordinary chat."""
+    if not body or not body.strip():
+        return False
+    text = body.strip()
+    if is_stop_command(text):
+        return True
+    if not text.startswith("/"):
+        return False
+    head = text.partition(" ")[0].casefold().lstrip("/").rstrip("!?.…:;")
+    return head in _COMMAND_NAMES
+
+
+def _parse_bare(body: str | None, name: str) -> bool:
+    """True when the whole message is ``/<name>`` — leading ``/`` required,
+    case ignored, trailing punctuation like ``STOP!!!`` tolerated (the stop
+    command's rules), no arguments.
+    """
+    if not body:
+        return False
+    text = body.strip()
+    if not text.startswith("/"):
+        return False
+    return text.casefold().lstrip("/").rstrip("!?.…:;") == name
+
+
+def parse_help_command(body: str | None) -> bool:
+    """True for a bare ``/help`` — and nothing else.
+
+    The whole message must be the command (leading ``/`` required, case
+    and trailing punctuation ignored).
+    """
+    return _parse_bare(body, "help")
+
+
+def parse_end_command(body: str | None) -> bool:
+    """True for a bare ``/end`` (closes the room's live session)."""
+    return _parse_bare(body, "end")
+
+
+def parse_retry_command(body: str | None) -> bool:
+    """True for a bare ``/retry`` (re-fires the last trigger message)."""
+    return _parse_bare(body, "retry")
+
+
+def parse_status_command(body: str | None) -> bool:
+    """True for a bare ``/status`` (activity + session report)."""
+    return _parse_bare(body, "status")
+
+
+def parse_unmute_command(body: str | None) -> tuple[bool, str]:
+    """True for ``/unmute`` or ``/unmute [@bot]``."""
+    if not body:
+        return False, ""
+    m = _UNMUTE_RE.match(body.strip())
+    if m is None:
+        return False, ""
+    return True, m.group(1).strip()
+
+
+def parse_mute_command(body: str | None) -> tuple[bool, str]:
+    """True for ``/mute`` with any argument text (``[@bot] [minutes]``).
+
+    ``/unmute`` never matches: its body starts with ``/u``, not ``/m``.
+    Argument validation (bot match, minutes range) happens in the handler.
+    """
+    if not body:
+        return False, ""
+    m = _MUTE_RE.match(body.strip())
+    if m is None:
+        return False, ""
+    return True, m.group(1).strip()
+
+
+def parse_new_command(body: str | None) -> tuple[bool, str]:
+    """True for ``/new`` or ``/new <text>`` — close the room's live session.
+
+    With text, a fresh session runs that prompt immediately; without, the
+    handler only acks and the next message starts fresh.
+    """
+    if not body:
+        return False, ""
+    m = _NEW_RE.match(body.strip())
+    if m is None:
+        return False, ""
+    return True, m.group(1).strip()
+
+
+#: leading zero-width characters that make a message invisible to bots
+#: (both verified to survive the Matrix wire untouched and to render as
+#: nothing — clients show no tofu)
+IGNORE_MARKERS = ("\u200c", "\ufeff")
+
+#: the marker this bot prefixes its own meta texts with (``_send_note``),
+#: so peer bots never treat an ack or notice as something to answer —
+#: works even where the ``peer_bots`` roster is not configured
+META_MARK = "\u200c"
+
+#: how long a room's live OpenCode session stays open after a finished run:
+#: the next message of the room within this window continues the session
+#: (every run re-arms the window), afterwards — or after ``/new``, ``/end``,
+#: ``/retry`` — the next message starts a fresh one
+SESSION_WINDOW_SECONDS = 120 * 60
+
+#: timeout for command-started runs that have no action behind them
+#: (``/new <text>`` in a room without triggers); trigger-backed runs use
+#: their own ``action.timeout``
+RUN_TIMEOUT_DEFAULT = 300
+
+#: upper bound accepted for ``/mute`` minutes (24 h)
+MUTE_MAX_MINUTES = 1440
+
+#: the menu ``/help`` posts into the room
+HELP_TEXT = (
+    "ℹ️ Commands in this room:\n"
+    "• stop — interrupt the action running here (acked by reaction)\n"
+    "• /help — this menu\n"
+    "• /status — what the bot is doing right now + room session state\n"
+    "• /effort [default|low|mid|high|xhigh] — show or set the reasoning "
+    "effort for this room\n"
+    "• /btw <text> — interject into the action currently running here\n"
+    f"• /new [text] / /end — close this room's session (it stays open "
+    f"{SESSION_WINDOW_SECONDS // 60} min between messages); /new <text> "
+    "starts a fresh run right away\n"
+    "• /retry — re-run the last trigger message in a fresh session\n"
+    "• /mute [@bot] [minutes] — mute this bot here (no minutes = "
+    "permanent); /mute 0 or /unmute unmutes\n"
+    f"Any message within {SESSION_WINDOW_SECONDS // 60} min of the last "
+    "answer continues this room's session; a message starting with a "
+    "zero-width character is invisible to bots. In group chats you can "
+    "address a command to one bot with a leading mention "
+    "(@bot /status). Everything else is handled by this room's trigger."
+)
+
+
 # ---------------------------------------------------------------------------
 # Waiting for a reply (consumers of incoming messages, ahead of triggers)
 # ---------------------------------------------------------------------------
@@ -389,6 +612,17 @@ class MessageWatcher:
         # Persisted (state dir) so a restart does not forget them.
         self._key_pending: dict[str, dict] = {}
         self._pending_file = Path(self.bot.client.state_dir) / "key_pending.json"
+        #: The room's live OpenCode session (casefolded room_id -> {"id":
+        #: session id, "expires": epoch, "managed": whether the webhooker
+        #: may delete it — false for ``keep_session`` actions).  A message
+        #: within the window continues it, afterwards it is deleted.
+        #: Persisted so a restart neither forgets nor double-deletes.
+        self._room_sessions: dict[str, dict] = {}
+        #: last fired trigger per room for ``/retry`` (casefolded room_id ->
+        #: {"trigger": <Trigger.room name>, "ev": <compact event>})
+        self._fired: dict[str, dict] = {}
+        self._room_session_file = (
+            Path(self.bot.client.state_dir) / "room_sessions.json")
 
     def _load_key_pending(self) -> None:
         try:
@@ -408,6 +642,111 @@ class MessageWatcher:
                 encoding="utf-8")
         except OSError as exc:
             _log(f"{self.tag} saving pending keys failed: {exc}")
+
+    def _load_room_state(self) -> None:
+        """Room sessions + last-fired triggers (persisted together).
+
+        Accepts the old ``last_session.json`` (a bare sessions map) from the
+        ``/continue`` era once, then continues in the new file.
+        """
+        raw = None
+        for path in (self._room_session_file,
+                     Path(self.bot.client.state_dir) / "last_session.json"):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                break
+            except (OSError, ValueError):
+                continue
+        if not isinstance(raw, dict):
+            return
+        if "sessions" in raw or "fired" in raw:
+            sessions = raw.get("sessions") or {}
+            fired = raw.get("fired") or {}
+        else:                                   # legacy: bare sessions map
+            sessions, fired = raw, {}
+        self._room_sessions = {str(k): v for k, v in sessions.items()
+                               if isinstance(v, dict) and v.get("id")}
+        self._fired = {str(k): v for k, v in fired.items()
+                       if isinstance(v, dict) and v.get("ev")}
+
+    def _save_room_state(self) -> None:
+        """Persist sessions + fired map (safe outside the session lock —
+        it takes its own snapshot)."""
+        with self._session_lock:
+            snapshot = {"sessions": dict(self._room_sessions),
+                        "fired": dict(self._fired)}
+        try:
+            self._room_session_file.write_text(
+                json.dumps(snapshot, indent=1, sort_keys=True),
+                encoding="utf-8")
+        except OSError as exc:
+            _log(f"{self.tag} saving room state failed: {exc}")
+
+    def _remember_session(self, room_id: str, session_id: str,
+                          managed: bool) -> None:
+        """Make this run's session the room's live conversation.
+
+        The window re-arms on every run; the room's previous live session
+        is deleted when a newer one replaces it (or later by the expiry
+        sweep).  Sessions of ``keep_session`` actions are registered (so
+        they stay the room's session) but never deleted by the webhooker.
+        """
+        key = room_id.casefold()
+        with self._session_lock:
+            old = self._room_sessions.get(key)
+            self._room_sessions[key] = {
+                "id": session_id,
+                "expires": time.time() + SESSION_WINDOW_SECONDS,
+                "managed": managed,
+            }
+        self._save_room_state()
+        if old and old.get("id") != session_id and old.get("managed"):
+            _log(f"{self.tag} room session {old['id']} replaced by "
+                 f"{session_id} for {room_id} — deleting")
+            self.bot.opencode.delete_session(old["id"])
+
+    def _claim_session(self, room_id: str) -> dict | None:
+        """Take the room's live session for the next run (``None`` when
+        there is none or its window closed — expired managed sessions are
+        deleted on the way)."""
+        key = room_id.casefold()
+        with self._session_lock:
+            entry = self._room_sessions.pop(key, None)
+        self._save_room_state()
+        if entry and entry.get("expires", 0) > time.time():
+            return entry
+        if entry and entry.get("managed"):
+            self.bot.opencode.delete_session(str(entry.get("id")))
+        return None
+
+    def _close_session(self, room_id: str) -> dict | None:
+        """Drop the room's live session for good (``/new``, ``/end``,
+        ``/retry``): managed sessions are deleted, ``keep_session`` ones
+        are only un-remembered (the webhooker never deletes them)."""
+        entry = self._claim_session(room_id)
+        if entry and entry.get("managed"):
+            self.bot.opencode.delete_session(str(entry.get("id")))
+        return entry
+
+    def _sweep_room_sessions(self) -> None:
+        """Delete the live sessions whose window expired (runs on every
+        sync round; deletes are best-effort)."""
+        now = time.time()
+        expired: list[str] = []
+        changed = False
+        with self._session_lock:
+            for key, entry in list(self._room_sessions.items()):
+                if entry.get("expires", 0) <= now:
+                    del self._room_sessions[key]
+                    changed = True
+                    if entry.get("managed"):
+                        expired.append(str(entry.get("id")))
+        if not changed:
+            return
+        self._save_room_state()
+        for sid in expired:
+            _log(f"{self.tag} session window of {sid} expired — deleting")
+            self.bot.opencode.delete_session(sid)
 
     def _register_pending(self, ev: dict, raw: dict) -> None:
         """Remember an undecryptable event and (re)request its key once."""
@@ -523,6 +862,7 @@ class MessageWatcher:
 
     def start(self) -> None:
         self._load_key_pending()
+        self._load_room_state()
         calls = getattr(self.bot, "calls", None)
         if calls is not None:
             calls.prewarm()      # greeting + cue, so a call starts talking at once
@@ -575,6 +915,7 @@ class MessageWatcher:
                 self._stop.wait(5)
 
     def _poll_once(self) -> None:
+        self._sweep_room_sessions()
         was_first = self._since is None
         result = self.bot.client.sync(since=self._since,
                                       timeout_ms=self.SYNC_TIMEOUT_MS)
@@ -752,10 +1093,15 @@ class MessageWatcher:
 
     def _send_note(self, room_id: str, message: str) -> None:
         """Post a short status text into the room (command acks, action
-        failures — the things that must never pass silently)."""
+        failures — the things that must never pass silently).
+
+        Always carries the invisible ``META_MARK`` prefix, so peer bots
+        treat it as human-only chatter and never answer it (module
+        docstring 1b); real model answers are posted elsewhere, unmarked.
+        """
         try:
-            self.bot.client.send_message(room_id,
-                                         {"msgtype": "m.text", "body": message})
+            self.bot.client.send_message(
+                room_id, {"msgtype": "m.text", "body": META_MARK + message})
         except MatrixError as exc:
             _log(f"{self.tag} sending the room notice failed: {exc}")
 
@@ -866,27 +1212,382 @@ class MessageWatcher:
         _log(f"{self.tag} /btw for {room_id} -> {delivered}/{len(targets)} "
              f"session(s) steered")
 
+    # -- /help command ----------------------------------------------------------
+
+    def _help_room(self, room_id: str) -> None:
+        """``/help`` posts the command menu into the room."""
+        self._send_note(room_id, HELP_TEXT)
+        _log(f"{self.tag} /help for {room_id}")
+
+    # -- /status command ----------------------------------------------------------
+
+    def _status_room(self, room_id: str) -> None:
+        """``/status``: what the bot is doing in this room right now.
+
+        For every run in flight it asks the OpenCode server for the live
+        activity (``session_activity``: thinking / running a tool and
+        awaiting its result / writing the answer), then adds the room's
+        session window, effort and mute state.  Works while muted.
+        """
+        key = room_id.casefold()
+        lines: list[str] = []
+        with self._session_lock:
+            active = list(self._sessions.get(key, []))
+            entry = dict(self._room_sessions.get(key) or {})
+        for sess in active:
+            sid = sess.session_ids[-1] if sess.session_ids else ""
+            state = self.bot.opencode.session_activity(sid) if sid \
+                else "starting up"
+            icon = ("✍️" if state.startswith("writing")
+                    else {"thinking": "🧠", "idle": "💤",
+                          "unknown": "❔"}.get(state, "⚙️"))
+            lines.append(f"▶️ running: {icon} {state}"
+                         f"{f' (session {sid})' if sid else ''}")
+        left = (entry.get("expires", 0) - time.time()) / 60 \
+            if entry else 0
+        if left > 0:
+            lines.append(f"💬 live session {entry.get('id')} — the next "
+                         f"message continues it ({left:.0f} min left)")
+        elif not active:
+            lines.append("💬 no live session — the next message starts a "
+                         "fresh one")
+        lines.append(f"⚙️ effort: {self.bot.effort.get(room_id) or 'default'}")
+        exp = self.bot.mute.expiry(room_id)
+        if exp is not None:
+            when = ("permanent — /unmute ends it" if exp == float("inf")
+                    else f"until {time.strftime('%H:%M', time.localtime(exp))}")
+            lines.append(f"🔇 muted in this room ({when})")
+        self._send_note(room_id, "ℹ️ Status:\n" + "\n".join(lines))
+        _log(f"{self.tag} /status for {room_id}")
+
+    # -- /mute and /unmute commands --------------------------------------------------
+
+    MUTE_USAGE = ("🔇 Usage: /mute [@bot] [minutes] — mutes this bot here "
+                  "(no minutes = permanent), /mute 0 or /unmute unmutes.")
+
+    def _targets_me(self, target: str) -> bool:
+        """True when an ``@name`` / ``@user:domain`` names this bot (local
+        part or configured name, domain ignored)."""
+        t = target.casefold().lstrip("@").split(":", 1)[0]
+        return t in {self.bot.cfg.user.casefold(), self.bot.cfg.name.casefold()}
+
+    def _mute_room(self, room_id: str, args: str) -> None:
+        """``/mute [@bot] [minutes]`` — word order of the two arguments is
+        free.  With an ``@name`` only the bot it matches mutes itself, the
+        others ignore the command silently (their acks would be noise).
+        No minutes = permanent mute; ``/mute 0`` unmutes."""
+        target = ""
+        minutes = -1
+        for tok in args.split():
+            t = tok.strip().rstrip(":;,.!")
+            if t.startswith("@"):
+                if target:
+                    self._send_note(room_id, self.MUTE_USAGE)
+                    return
+                target = t
+            elif t.isdigit():
+                if minutes >= 0:
+                    self._send_note(room_id, self.MUTE_USAGE)
+                    return
+                minutes = int(t)
+            else:
+                self._send_note(room_id, self.MUTE_USAGE)
+                return
+        if minutes > MUTE_MAX_MINUTES:
+            self._send_note(room_id, f"🔇 That is a lot of minutes — the "
+                                     f"limit is {MUTE_MAX_MINUTES}.")
+            return
+        if target and not self._targets_me(target):
+            _log(f"{self.tag} /mute {args!r} in {room_id} -> not me, "
+                 f"ignoring")
+            return
+        me = self.bot.user_id
+        if minutes == 0:
+            self.bot.mute.set(room_id, 0)
+            self._send_note(room_id, f"🔊 {me} is unmuted in this room.")
+        elif minutes > 0:
+            self.bot.mute.set(room_id, minutes * 60)
+            until = time.strftime("%H:%M",
+                                  time.localtime(time.time() + minutes * 60))
+            self._send_note(room_id, f"🔇 {me} is muted in this room for "
+                                     f"{minutes} min (until {until}) — "
+                                     f"/unmute or /mute 0 ends it.")
+        else:
+            self.bot.mute.set(room_id, None)
+            self._send_note(room_id, f"🔇 {me} is muted in this room until "
+                                     f"/unmute.")
+        _log(f"{self.tag} /mute {args or '(self, permanent)'} -> {room_id}")
+
+    def _unmute_room(self, room_id: str, args: str) -> None:
+        """``/unmute [@bot]``: end the mute (target rules as ``/mute``)."""
+        tokens = args.split()
+        if len(tokens) > 1 or (tokens and not tokens[0].startswith("@")):
+            self._send_note(room_id, "🔊 Usage: /unmute [@bot].")
+            return
+        if tokens and not self._targets_me(tokens[0]):
+            _log(f"{self.tag} /unmute {args!r} in {room_id} -> not me, "
+                 f"ignoring")
+            return
+        was_muted = self.bot.mute.expiry(room_id) is not None
+        self.bot.mute.set(room_id, 0)
+        state = ("was muted" if was_muted else "was not muted")
+        self._send_note(room_id, f"🔊 {self.bot.user_id} {state} — it is "
+                                 f"unmuted in this room now.")
+        _log(f"{self.tag} /unmute -> {room_id} (was_muted={was_muted})")
+
+    # -- /new and /end commands -------------------------------------------------------
+
+    def _end_room(self, room_id: str) -> None:
+        """``/end`` (and a bare ``/new``): close the room's live session —
+        the next message starts a fresh one.  Ack only, no prompt."""
+        closed = self._close_session(room_id)
+        self._send_note(room_id,
+                        f"🆕 The room's session ({closed['id']}) is closed — "
+                        f"the next message starts a fresh one."
+                        if closed else
+                        "🆕 This room has no live session — every message "
+                        "starts a fresh one anyway.")
+        _log(f"{self.tag} /end for {room_id} "
+             f"closed={closed['id'] if closed else 'nothing'}")
+
+    def _new_room(self, room_id: str, text: str, ev: dict) -> None:
+        """``/new [text]``: close the live session; with text, immediately
+        run it as a prompt in a fresh session (background thread)."""
+        if not text:
+            self._end_room(room_id)
+            return
+        # close the old conversation first: if the fresh run fails, the
+        # room must not silently keep continuing the session /new ended
+        self._close_session(room_id)
+        trig = next((t for t in self.bot.cfg.triggers
+                     if t.matches(room_id, ev.get("room_name"))), None)
+        threading.Thread(target=self._new_run,
+                         args=(room_id, text, ev, trig),
+                         name=f"new-{self.bot.name}".replace("/", "_"),
+                         daemon=True).start()
+
+    def _new_run(self, room_id: str, text: str, ev: dict, trig) -> None:
+        """Background run started by ``/new <text>``: always fresh session,
+        with 🔧 and ``stop`` bookkeeping like a trigger run.  Uses the
+        room's trigger action (persona, placeholders: ``{{msg}}`` = the
+        given text); rooms without triggers get a plain prompt."""
+        tag = f"[new:{self.bot.name}]"
+        key = room_id.casefold()
+        sess = _Session(room_id)
+        with self._session_lock:
+            self._sessions.setdefault(key, []).append(sess)
+        rid = self._react_on(room_id, ev.get("event_id"))
+        if rid:
+            with self._session_lock:
+                sess.reactions.append(rid)
+        try:
+            if trig is not None:
+                action = trig.action
+                values = {"channel": ev.get("room_name") or room_id,
+                          "room": room_id,
+                          "sender": ev.get("sender") or "",
+                          "msg": text}
+                prompt = render_text(action.prompt, values)
+                system, model = action.system, action.model
+                agent = action.agent
+                directory = action.directory or str(BASE_DIR)
+                timeout = action.timeout
+                managed = not action.keep_session
+            else:
+                prompt, system, model, agent = text, "", "", ""
+                directory = str(BASE_DIR)
+                timeout = RUN_TIMEOUT_DEFAULT
+                managed = True
+            title = (f"MatrixWebhooker {self.bot.name} "
+                     f"{ev.get('room_name') or room_id}")
+
+            def _note(new_sid: str) -> None:
+                with self._session_lock:
+                    sess.session_ids.append(new_sid)
+
+            result = self.bot.opencode.run(
+                title=title, prompt=prompt, system=system, model=model,
+                agent=agent, directory=directory,
+                variant=self.bot.effort.get(room_id), timeout=timeout,
+                cancel=lambda: sess.cancelled, keep_session=True,
+                on_session=_note, log=lambda m: _log(f"{tag} {m}"))
+            if result.outcome == "succeeded":
+                _log(f"{tag} /new answered ({len(result.text)} chars)")
+            else:
+                _log(f"{tag} /new run outcome: {result.outcome} "
+                     f"{result.error or ''}".rstrip())
+            self._post_outcome(room_id, sess, result, timeout)
+            if result.outcome == "succeeded" and result.session_id:
+                self._remember_session(room_id, result.session_id, managed)
+            elif result.session_id and managed and result.outcome != "failed":
+                self.bot.opencode.delete_session(result.session_id)
+        finally:
+            with self._session_lock:
+                live = self._sessions.get(key)
+                if live and sess in live:
+                    live.remove(sess)
+            self._clean_up(sess)
+            _log(f"{tag} /new run finished for {room_id}")
+
+    # -- /retry command ---------------------------------------------------------------
+
+    def _retry_room(self, room_id: str, room_name: str | None) -> None:
+        """``/retry``: re-fire the room's last trigger message — always in
+        a fresh session (the live one is closed first)."""
+        key = room_id.casefold()
+        with self._session_lock:
+            entry = dict(self._fired.get(key) or {})
+        if not entry.get("ev"):
+            self._send_note(room_id, "🔁 Nothing to retry — this room has no "
+                                      "recorded trigger message yet.")
+            return
+        trig = next((t for t in self.bot.cfg.triggers
+                     if t.room == entry.get("trigger")), None)
+        if trig is None:
+            trig = next((t for t in self.bot.cfg.triggers
+                         if t.matches(room_id, room_name)), None)
+        if trig is None:
+            self._send_note(room_id, "🔁 The trigger that produced the last "
+                                      "message is gone from bots.json.")
+            return
+        self._close_session(room_id)          # force a fresh session
+        ev = dict(entry["ev"])
+        ev.setdefault("room_name", room_name)
+        _log(f"{self.tag} /retry in {room_id} -> re-firing {trig.room!r}")
+        threading.Thread(target=self._fire, args=(trig, ev),
+                         name=f"retry-{self.bot.name}".replace("/", "_"),
+                         daemon=True).start()
+
+    # -- run outcome --------------------------------------------------------------
+
+    def _post_outcome(self, room_id: str, sess: _Session, result,
+                      timeout_s: float) -> None:
+        """Post a finished run's outcome into the room: the final answer
+        (never ``NO_REPLY``, never after a stop) or the 🤔/⏳/⚠️ notice —
+        a run that ends without an answer never passes silently."""
+        if sess.cancelled:
+            return
+        if result.outcome == "succeeded":
+            if is_silent_reply(result.text):
+                _log(f"{self.tag} model replied {SILENT_REPLY} — nothing "
+                     f"posted")
+                return
+            if result.text:
+                try:
+                    self.bot.client.send_message(
+                        room_id, {"msgtype": "m.text", "body": result.text})
+                except MatrixError as exc:
+                    _log(f"{self.tag} posting the answer failed: {exc}")
+            else:
+                _log(f"{self.tag} the model produced no text — nothing to "
+                     f"post")
+                self._send_note(room_id, "🤔 The action ran to its end, "
+                                         "but the model produced no text.")
+        elif result.outcome == "timeout":
+            self._send_note(room_id, f"⏳ The action timed out after "
+                                     f"{timeout_s:.0f}s (action.timeout) — "
+                                     f"no answer.")
+        elif result.outcome != "interrupted":
+            why = " ".join(str(result.error or "no error detail").split())
+            if len(why) > 300:
+                why = why[:300] + "…"
+            note = f"⚠️ The action failed: {why}"
+            if result.session_id:
+                note += (f" (OpenCode session {result.session_id} kept "
+                         "for inspection)")
+            self._send_note(room_id, note)
+
     # -- per-message pipeline ---------------------------------------------------
+
+    def _command_is_for_me(self, ev: dict, tokens: list[str]) -> bool:
+        """True when a command in this message is addressed to this bot.
+
+        A command that tags nobody is for the whole room (every bot acts);
+        a leading ``@room``/``@here`` or a token naming this bot includes
+        it; so does an ``m.mentions`` pill on it (Element turns typed
+        mentions into pills plus the plain ``@user:server`` body text).
+        """
+        if not tokens and not extract_mentions(ev):
+            return True
+        if tags_bot_itself(ev, self.bot.user_id):
+            return True
+        names = {self.bot.cfg.user.casefold(), self.bot.cfg.name.casefold()}
+        return any(_mention_token_is_me(t, names) for t in tokens)
 
     def _handle(self, ev: dict) -> None:
         if ev.get("sender") == self.bot.user_id:
             return  # from the bot itself: never waits, never triggers
+        body = ev.get("body") or ""
+        if body[:1] in IGNORE_MARKERS:
+            # invisible to bots (see module docstring 1b): no trigger, no
+            # command, no waiter, no reaction
+            _log(f"{self.tag} {ev.get('room_id')} {ev.get('sender')}: "
+                 f"ignored (zero-width marker: written for humans)")
+            return
         room_id = ev["room_id"]
         room_name = self._name_for(room_id, ev.get("room_name"))
         where = f"room={room_name or room_id}"
 
-        if is_stop_command(ev.get("body")):
+        # Commands may be addressed with leading mentions ("@kraken /status"
+        # in a group chat): they parse against the mention-stripped body and
+        # only run on the bots the mentions actually point at; a command for
+        # another bot is ignored here entirely (before any trigger could see
+        # it) instead of being answered as ordinary chat.
+        cmd_body, mentioned = strip_leading_mentions(body)
+        if _looks_like_command(cmd_body) and not self._command_is_for_me(
+                ev, mentioned):
+            _log(f"{self.tag} {where} sender={ev.get('sender')} -> command "
+                 f"addressed to another bot, staying silent")
+            return
+
+        if is_stop_command(cmd_body):
             self._stop_room(room_id, where, ev.get("event_id") or "")
             return
 
-        is_effort, level = parse_effort_command(ev.get("body"))
+        if parse_help_command(cmd_body):
+            self._help_room(room_id)
+            return
+
+        if parse_status_command(cmd_body):
+            self._status_room(room_id)
+            return
+
+        is_mute, mute_args = parse_mute_command(cmd_body)
+        if is_mute:
+            self._mute_room(room_id, mute_args)
+            return
+
+        is_unmute, unmute_args = parse_unmute_command(cmd_body)
+        if is_unmute:
+            self._unmute_room(room_id, unmute_args)
+            return
+
+        if self.bot.mute.expiry(room_id) is not None:
+            _log(f"{self.tag} {where} sender={ev.get('sender')} -> ignored "
+                 f"(muted in this room)")
+            return
+
+        is_effort, level = parse_effort_command(cmd_body)
         if is_effort:
             self._effort_room(room_id, level)
             return
 
-        is_btw, btw_text = parse_btw_command(ev.get("body"))
+        is_btw, btw_text = parse_btw_command(cmd_body)
         if is_btw:
             self._btw_room(room_id, btw_text, ev)
+            return
+
+        if parse_end_command(cmd_body):
+            self._end_room(room_id)
+            return
+
+        is_new, new_text = parse_new_command(cmd_body)
+        if is_new:
+            self._new_room(room_id, new_text, ev)
+            return
+
+        if parse_retry_command(cmd_body):
+            self._retry_room(room_id, room_name)
             return
 
         if not addressed_to_bot(ev, self.bot.user_id):
@@ -934,6 +1635,17 @@ class MessageWatcher:
         room_id = ev["room_id"]
         key = room_id.casefold()
 
+        # remember for /retry: compact copy of what a re-fire needs
+        with self._session_lock:
+            self._fired[key] = {
+                "trigger": trig.room,
+                "ev": {"room_id": room_id, "room_name": ev.get("room_name"),
+                       "event_id": ev.get("event_id"),
+                       "sender": ev.get("sender"), "ts": ev.get("ts"),
+                       "body": ev.get("body")},
+            }
+        self._save_room_state()
+
         sess = _Session(room_id)
         with self._session_lock:
             self._sessions.setdefault(key, []).append(sess)
@@ -957,76 +1669,93 @@ class MessageWatcher:
     def _run_action(self, tag: str, trig, sess: _Session,
                     room_id: str, ev: dict) -> None:
         room_name = ev.get("room_name")
-        try:
-            history = self.bot.client.read_messages(room_id, limit=trig.context,
-                                                    crypto=self.bot.crypto)
-        except MatrixError as exc:
-            _log(f"{tag} reading history failed: {exc}")
-            history = [ev]
-        if not any(m.get("event_id") == ev.get("event_id") for m in history):
-            # Sync was first: make sure the triggering message is in context.
-            history = [*history, ev]
-            history = history[-trig.context:]
-        values = {
-            "channel": room_name or room_id,
-            "room": room_id,
-            "sender": ev.get("sender") or "",
-            "msg": format_history(history),
-        }
         action = trig.action
+        # The room's live session decides how this message is admitted:
+        # inside its window the message continues the conversation ({{msg}}
+        # then carries only the new message — the session already knows the
+        # rest), otherwise a fresh session gets the full history render.
+        cont = self._claim_session(room_id)
         if sess.cancelled:
             _log(f"{tag} cancelled before the action started")
+            if cont:
+                self._remember_session(room_id, str(cont.get("id")),
+                                       managed=bool(cont.get("managed")))
             return
-        started = time.monotonic()
-
-        def _note_session(sid: str) -> None:
+        if cont:
+            sid = str(cont.get("id"))
+            managed = bool(cont.get("managed"))
             with self._session_lock:
-                sess.session_ids.append(sid)
+                sess.session_ids.append(sid)   # so "stop" can interrupt it
+            values = {
+                "channel": room_name or room_id,
+                "room": room_id,
+                "sender": ev.get("sender") or "",
+                "msg": format_history([ev]),
+            }
+            _log(f"{tag} continuing the room's live session {sid}")
+            started = time.monotonic()
+            result = self.bot.opencode.continue_session(
+                sid, prompt=render_text(action.prompt, values),
+                timeout=action.timeout, cancel=lambda: sess.cancelled,
+                keep_session=True, log=lambda m: _log(f"{tag} {m}"))
+        else:
+            managed = not action.keep_session
+            try:
+                history = self.bot.client.read_messages(
+                    room_id, limit=trig.context, crypto=self.bot.crypto)
+            except MatrixError as exc:
+                _log(f"{tag} reading history failed: {exc}")
+                history = [ev]
+            if not any(m.get("event_id") == ev.get("event_id")
+                       for m in history):
+                # Sync was first: make sure the triggering message is in
+                # context.
+                history = [*history, ev]
+                history = history[-trig.context:]
+            values = {
+                "channel": room_name or room_id,
+                "room": room_id,
+                "sender": ev.get("sender") or "",
+                "msg": format_history(history),
+            }
 
-        result = self.bot.opencode.run(
-            title=f"MatrixWebhooker {self.bot.name} {room_name or room_id}",
-            prompt=render_text(action.prompt, values),
-            system=action.system, model=action.model, agent=action.agent,
-            directory=action.directory or str(BASE_DIR),
-            variant=self.bot.effort.get(room_id),
-            timeout=action.timeout, cancel=lambda: sess.cancelled,
-            keep_session=action.keep_session, on_session=_note_session,
-            log=lambda m: _log(f"{tag} {m}"))
+            def _note_session(new_sid: str) -> None:
+                with self._session_lock:
+                    sess.session_ids.append(new_sid)
+
+            started = time.monotonic()
+            result = self.bot.opencode.run(
+                title=f"MatrixWebhooker {self.bot.name} "
+                      f"{room_name or room_id}",
+                prompt=render_text(action.prompt, values),
+                system=action.system, model=action.model, agent=action.agent,
+                directory=action.directory or str(BASE_DIR),
+                variant=self.bot.effort.get(room_id),
+                timeout=action.timeout, cancel=lambda: sess.cancelled,
+                keep_session=True,  # lifetime is decided below
+                on_session=_note_session,
+                log=lambda m: _log(f"{tag} {m}"))
         dt = time.monotonic() - started
         if result.outcome == "succeeded":
             _log(f"{tag} answered in {dt:.1f}s ({len(result.text)} chars)")
-            if is_silent_reply(result.text):
-                _log(f"{tag} model replied {SILENT_REPLY} — nothing posted")
-            elif result.text and not sess.cancelled:
-                try:
-                    self.bot.client.send_message(
-                        room_id, {"msgtype": "m.text", "body": result.text})
-                except MatrixError as exc:
-                    _log(f"{tag} posting the answer failed: {exc}")
-            elif not result.text:
-                _log(f"{tag} the model produced no text — nothing to post")
-                if not sess.cancelled:
-                    self._send_note(room_id, "🤔 The action ran to its end, "
-                                             "but the model produced no text.")
         elif result.outcome == "timeout":
             _log(f"{tag} no answer after {dt:.1f}s (action.timeout)")
-            if not sess.cancelled:
-                self._send_note(room_id, f"⏳ The action timed out after "
-                                         f"{dt:.0f}s (action.timeout is "
-                                         f"{action.timeout}s) — no answer.")
         elif result.outcome == "interrupted":
             _log(f"{tag} interrupted after {dt:.1f}s")
-        else:
+        elif result.outcome == "failed":
             _log(f"{tag} action failed after {dt:.1f}s: {result.error} "
                  f"(session {result.session_id} kept for inspection)")
-            if not sess.cancelled:
-                why = " ".join(str(result.error or "no error detail").split())
-                if len(why) > 300:
-                    why = why[:300] + "…"
-                note = f"⚠️ The action failed after {dt:.1f}s: {why}"
-                if result.session_id:
-                    note += (f" (OpenCode session {result.session_id} "
-                             "kept for inspection)")
-                self._send_note(room_id, note)
+        else:
+            _log(f"{tag} run errored after {dt:.1f}s: {result.error}")
+        self._post_outcome(room_id, sess, result, action.timeout)
+        # Session lifetime (the run itself always keeps, see above): a
+        # succeeded run's session stays open as the room's live
+        # conversation, a failed one stays for inspection in the TUI,
+        # everything else is deleted again — sessions of keep_session
+        # actions always stay.
+        if result.outcome == "succeeded" and result.session_id:
+            self._remember_session(room_id, result.session_id, managed)
+        elif result.session_id and managed and result.outcome != "failed":
+            self.bot.opencode.delete_session(result.session_id)
         if sess.cancelled:
             _log(f"{tag} stopped by user command")
