@@ -10,6 +10,8 @@ Endpoints:
                 "msgtype": "m.text (default) | m.notice",
                 "html": "optional HTML body",
                 "room_id": "optional override of the bot's default room"}
+         A Grafana/Alertmanager alert payload (no "text", but an "alerts"
+         list) is rendered into a readable 🔴/✅ message automatically.
     POST /wait       block for the bot's next message in a room; that message
                      skips the bot's triggers (body: {"room_id": "!...", "timeout": 120})
     POST /call       place an outgoing MatrixRTC voice call in a room the bot
@@ -198,6 +200,32 @@ def messages(room_id: str):
     return jsonify({"bot": bot.name, "room": room_id, "messages": events})
 
 
+def _render_grafana_alerts(data: dict) -> str | None:
+    """Render a Grafana/Alertmanager webhook payload as plain text.
+
+    Matches the body Grafana's ``webhook`` contact point posts (an "alerts"
+    list, no "text"), one line per alert: status icon, alertname and the
+    summary/description annotation. Returns None if this is not such a
+    payload.
+    """
+    alerts = data.get("alerts")
+    if not isinstance(alerts, list) or not alerts:
+        return None
+    lines: list[str] = []
+    for alert in alerts:
+        if not isinstance(alert, dict):
+            continue
+        labels = alert.get("labels") or {}
+        annotations = alert.get("annotations") or {}
+        icon = "🔴" if alert.get("status") == "firing" else "✅"
+        name = labels.get("alertname") or "alert"
+        text = (annotations.get("description") or annotations.get("summary")
+                or " ".join(f"{k}={v}" for k, v in labels.items()
+                            if k not in ("alertname", "grafana_folder")))
+        lines.append(f"{icon} {name}: {text}")
+    return "\n".join(lines) or None
+
+
 @app.post("/webhook")
 def webhook():
     bot = _authed_bot()
@@ -209,7 +237,7 @@ def webhook():
     if not isinstance(data, dict):
         return jsonify({"error": "body must be a JSON object"}), 400
 
-    text = data.get("text") or data.get("msg")
+    text = data.get("text") or data.get("msg") or _render_grafana_alerts(data)
     if not isinstance(text, str) or not text.strip():
         return jsonify({"error": "missing required field 'text'"}), 400
 
