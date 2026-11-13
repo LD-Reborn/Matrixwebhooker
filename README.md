@@ -440,7 +440,10 @@ same walk at **that user's** messages instead:
   untagged `/prune` is refused with a usage note.
 - **You need the room's redact power** (your level in
   `m.room.power_levels` against the level required for `m.room.redaction`,
-  default 50). Without a user mention the bot only touches its own
+  default 50; room-version-12 *creators* count too — they hold PL 100
+  implicitly and the server even refuses to list them in the `users`
+  map, so the check consults `m.room.create` when the map looks empty).
+  Without a user mention the bot only touches its own
   messages, which any sender could redact anyway; with one, the bot acts
   as your hands, and the server refuses unless you hold that power.
 - **The user scope is exactly one mention.** It goes anywhere in the

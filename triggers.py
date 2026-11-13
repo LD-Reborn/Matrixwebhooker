@@ -649,21 +649,28 @@ def _prune_phrases(spec: tuple, owner: str = "my") -> tuple[str, str]:
     return kept, within
 
 
-def sender_may_redact(power_levels: dict, sender: str) -> bool:
+def sender_may_redact(power_levels: dict, sender: str,
+                      creators=()) -> bool:
     """``/prune``'s policy gate: whether ``sender`` holds the room's redact
     power per its ``m.room.power_levels`` content — their level (or
     ``users_default``) against the level required for ``m.room.redaction``
-    events (``events`` map, else the legacy ``redact`` key, else 50)."""
-    users = power_levels.get("users") or {}
-    level = users.get(sender)
-    if level is None:
-        fold = sender.casefold()
-        level = next((lv for uid, lv in users.items()
-                      if str(uid).casefold() == fold), None)
-    if level is None:
-        level = power_levels.get("users_default", 0)
+    events (``events`` map, else the legacy ``redact`` key, else 50).
+    ``creators`` (``MatrixClient.room_creators``) are counted at 100:
+    room version 12 gives creators their power implicitly and refuses to
+    list them in the ``users`` map at all."""
+    fold = sender.casefold()
     required = (power_levels.get("events") or {}).get(
         "m.room.redaction", power_levels.get("redact", 50))
+    if any(str(c).casefold() == fold for c in creators):
+        level: object = 100
+    else:
+        users = power_levels.get("users") or {}
+        level = users.get(sender)
+        if level is None:
+            level = next((lv for uid, lv in users.items()
+                          if str(uid).casefold() == fold), None)
+        if level is None:
+            level = power_levels.get("users_default", 0)
     try:
         return int(level) >= int(required)
     except (TypeError, ValueError):
@@ -1885,12 +1892,17 @@ class MessageWatcher:
         sender = ev.get("sender") or ""
         try:
             pl = self.bot.client.power_levels(room_id)
+            creators: list[str] = []
+            if not sender_may_redact(pl, sender):
+                # a room version 12 creator holds the power implicitly and
+                # is not listed in the users map — ask m.room.create
+                creators = self.bot.client.room_creators(room_id)
         except MatrixError as exc:
             self._send_note(room_id,
                             f"🧹 Could not check this room's power levels: "
                             f"{exc}")
             return
-        if not sender_may_redact(pl, sender):
+        if not sender_may_redact(pl, sender, creators):
             self._send_note(room_id,
                             f"🧹 {sender} does not hold this room's redact "
                             f"power — a prune from you would be refused by "

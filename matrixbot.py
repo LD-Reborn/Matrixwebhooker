@@ -937,6 +937,47 @@ class Matrix:
                                     f"{quote(room_id, safe='')}/joined_members")
         return list((data.get("joined") or {}).keys())
 
+    def room_creators(self, room_id: str) -> list[str]:
+        """The user ids holding this room's creator identity (the
+        ``m.room.create`` content's ``creators``/``creator`` plus room
+        version 12's ``additional_creators``), and its creator event's
+        ``sender``.
+
+        Room version 12 lets the creators live outside the
+        ``m.room.power_levels`` ``users`` map - the server even rejects
+        listing a creator there ("Creator user X must not appear in
+        content.users") because it gives them their power implicitly.  An
+        availability check that reads only ``users`` would therefore call
+        a plain member of such a room a nobody; the creator id is what
+        makes the same check come out right.
+        """
+        try:
+            state = self._request(
+                "GET", f"{self.hs}/_matrix/client/v3/rooms/"
+                       f"{quote(room_id, safe='')}/state")
+        except MatrixError as exc:
+            if exc.status == 404:
+                return []
+            raise
+        for event in state.get("events") or []:
+            if event.get("type") != "m.room.create" \
+                    or event.get("state_key") != "":
+                continue
+            content = event.get("content") or {}
+            ids = [*(content.get("creators") or []),
+                   *(content.get("additional_creators") or [])]
+            if content.get("creator"):
+                ids.append(content["creator"])
+            if event.get("sender"):
+                ids.append(event["sender"])
+            out: list[str] = []
+            for uid in ids:
+                if isinstance(uid, str) and uid.casefold() not in {
+                        x.casefold() for x in out}:
+                    out.append(uid)
+            return out
+        return []
+
     def power_levels(self, room_id: str) -> dict:
         """The room's ``m.room.power_levels`` state content (``{}`` when the
         room somehow has none).  The trailing slash is the empty state key
