@@ -24,7 +24,8 @@ bot receives — any channel it is in, including DMs — in this order:
      delivered to a waiter or fired as a trigger.  It is acked by *reacting*
      to the stop message (🛑 something stopped / ⭕ nothing was running) —
      a text ack would re-trigger other bots in multi-bot rooms (echo loops).
-  2a. ``/help`` posts the command menu; ``/status`` reports the live
+  2a. ``/help`` posts the command menu, ``/help <command>`` explains one
+      command (keeps the menu short); ``/status`` reports the live
       activity of every run in flight (thinking / running a tool /
       writing the answer — see ``opencode_api.session_activity``) plus
       the code version (``version.app_version``, git describe) and the
@@ -35,9 +36,9 @@ bot receives — any channel it is in, including DMs — in this order:
       act, the others stay silent; no minutes = permanent mute),
       ``/mute 0`` or ``/unmute [@bot]`` ends it.  A muted bot ignores
       everything from here on (triggers, waiters, ``/effort``, ``/btw``,
-      ``/new``, ``/revert``) except ``stop``, ``/help``, ``/status``,
-      ``/mute`` and ``/unmute``.  Mutes are persisted in the bot's
-      state dir.
+      ``/new``, ``/revert``, ``/prune``) except ``stop``, ``/help``,
+      ``/status``, ``/mute`` and ``/unmute``.  Mutes are persisted in
+      the bot's state dir.
   2c. ``/effort`` (list the reasoning-effort levels of the room) and
       ``/effort <default|low|mid|high|xhigh>`` (set it for the room, persisted
       in the bot's state dir) — the room's level becomes the model
@@ -70,6 +71,12 @@ bot receives — any channel it is in, including DMs — in this order:
       run whose final text is exactly ``NO_REPLY`` posts nothing at all:
       that is the escape hatch a prompt should offer the model for
       "nothing to add".
+  2i. ``@bot /prune <retention>`` — destructive, so it must name its
+      bot(s): every mentioned bot redacts **its own** messages older than
+      the retention window (a message count like ``50``, a span like
+      ``2 weeks``, or a date like ``10.11.2026`` — see ``/help prune``),
+      provided the sender holds the room's redact power.  Runs as a
+      cancellable room session: ``stop`` ends it, 🔧 marks it.
   3. if a client is waiting for a reply in that room (``POST /wait``, or
      the MCP ``wait_for_reply`` tool), the message is handed to the oldest
      waiter instead of running any triggers.  While a trigger run for that
@@ -113,8 +120,10 @@ suppression always live in exactly one process (no double-firing).
 
 from __future__ import annotations
 
+import calendar
 import json
 import re
+import secrets
 import sys
 import threading
 import time
@@ -320,7 +329,7 @@ def _mention_token_is_me(token: str, names: set[str]) -> bool:
 #: command names ``_looks_like_command`` recognizes (keep in sync with the
 #: parsers the pipeline runs before the mention gates)
 _COMMAND_NAMES = {"help", "status", "mute", "unmute", "effort", "btw",
-                  "new", "end", "revert", "retry"}
+                  "new", "end", "revert", "retry", "prune"}
 
 
 def _looks_like_command(body: str | None) -> bool:
@@ -351,13 +360,24 @@ def _parse_bare(body: str | None, name: str) -> bool:
     return text.casefold().lstrip("/").rstrip("!?.…:;") == name
 
 
-def parse_help_command(body: str | None) -> bool:
-    """True for a bare ``/help`` — and nothing else.
+_HELP_RE = re.compile(r"^/help\b[\s,]*(.*)$", re.IGNORECASE | re.DOTALL)
+
+
+def parse_help_command(body: str | None) -> tuple[bool, str]:
+    """True for ``/help`` or ``/help <command>`` — and nothing else.
 
     The whole message must be the command (leading ``/`` required, case
-    and trailing punctuation ignored).
+    and trailing punctuation ignored); the optional topic is returned
+    stripped and lowercased (``""`` for the bare menu).  A leading slash
+    on the topic (``/help /prune``) is tolerated.
     """
-    return _parse_bare(body, "help")
+    if not body:
+        return False, ""
+    m = _HELP_RE.match(body.strip())
+    if m is None:
+        return False, ""
+    topic = m.group(1).strip().casefold().lstrip("/").rstrip("!?.…:;")
+    return True, topic
 
 
 def parse_end_command(body: str | None) -> bool:
@@ -421,6 +441,184 @@ def parse_new_command(body: str | None) -> tuple[bool, str]:
     return True, m.group(1).strip()
 
 
+# ---------------------------------------------------------------------------
+# /prune: argument parsing
+# ---------------------------------------------------------------------------
+
+_PRUNE_RE = re.compile(r"^/prune\b[\s,]*(.*)$", re.IGNORECASE | re.DOTALL)
+_PRUNE_COUNT_RE = re.compile(r"^(\d+)$")
+_PRUNE_SPAN_RE = re.compile(r"^(\d+)\s+([a-z]+)$")
+_PRUNE_DOTS_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})\.?(\d{2,4})?$")
+_PRUNE_SLASH_RE = re.compile(r"^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$")
+_PRUNE_ISO_RE = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})$")
+
+#: unit spellings ``/prune <n> <unit>`` accepts, normalised; "messages"
+#: keeps a count, the rest keep a time span
+_PRUNE_UNITS = {
+    "message": "messages", "messages": "messages",
+    "msg": "messages", "msgs": "messages",
+    "minute": "minutes", "minutes": "minutes", "min": "minutes",
+    "mins": "minutes",
+    "hour": "hours", "hours": "hours", "h": "hours", "hr": "hours",
+    "hrs": "hours",
+    "day": "days", "days": "days", "d": "days",
+    "week": "weeks", "weeks": "weeks", "w": "weeks", "wk": "weeks",
+    "wks": "weeks",
+    "month": "months", "months": "months", "mo": "months",
+    "mth": "months", "mths": "months",
+    "year": "years", "years": "years", "y": "years", "yr": "years",
+    "yrs": "years",
+}
+
+
+def parse_prune_command(body: str | None) -> tuple[bool, str]:
+    """True for ``/prune <retention>`` — argument text returned as typed
+    (dots in dates are meaningful, so nothing is stripped)."""
+    if not body:
+        return False, ""
+    m = _PRUNE_RE.match(body.strip())
+    if m is None:
+        return False, ""
+    return True, m.group(1).strip()
+
+
+def _prune_date(text: str) -> tuple[int, int, int] | None:
+    """Validate a date and return ``(y, m, d)`` — ``DD.MM[.YY[YY]]``
+    (European, day first), ``MM/DD[/YY[YY]]`` (US, month first) or
+    ``YYYY-MM-DD`` (ISO).  Missing year = this year; an obviously swapped
+    day/month (``25/12`` typed as ``12/25``-style, or ``11.25.``) is
+    accepted by swapping; anything else is not a date."""
+    m = _PRUNE_ISO_RE.match(text)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        m = _PRUNE_DOTS_RE.match(text)
+        if m is not None:
+            d, mo = int(m.group(1)), int(m.group(2))       # European
+        else:
+            m = _PRUNE_SLASH_RE.match(text)
+            if m is None:
+                return None
+            mo, d = int(m.group(1)), int(m.group(2))       # US
+        if mo > 12 and d <= 12:                            # swapped
+            mo, d = d, mo
+        year = m.group(3)
+        if year is None:
+            y = time.localtime().tm_year
+        else:
+            y = int(year)
+            if len(year) == 2:
+                y += 2000
+    try:
+        last = calendar.monthrange(y, mo)[1]
+    except (ValueError, calendar.IllegalMonthError):
+        return None
+    if not 1 <= d <= last:
+        return None
+    return y, mo, d
+
+
+def _prune_span_cutoff(n: int, unit: str, now: float) -> float:
+    """The epoch seconds ``now - n <unit>`` (months/years shift the
+    calendar date, clamping e.g. May 31 → Apr 30)."""
+    fixed = {"minutes": 60, "hours": 3600, "days": 86400,
+             "weeks": 7 * 86400}
+    if unit in fixed:
+        return now - n * fixed[unit]
+    ts = time.localtime(now)
+    back = n * 12 if unit == "years" else n
+    total = ts.tm_year * 12 + ts.tm_mon - 1 - back
+    y, mo = total // 12, total % 12 + 1
+    d = min(ts.tm_mday, calendar.monthrange(y, mo)[1])
+    return time.mktime((y, mo, d, ts.tm_hour, ts.tm_min, ts.tm_sec,
+                        ts.tm_wday, ts.tm_yday, ts.tm_isdst))
+
+
+def parse_prune_spec(args: str) -> tuple | str:
+    """``/prune``'s argument → a retention spec, or ``""`` if invalid.
+
+    ``("count", n)`` keeps the bot's own last *n* messages;
+    ``("span", cutoff_epoch, "2 weeks")`` and ``("date", cutoff_epoch,
+    "10.11.2026")`` keep everything newer than a time span / calendar
+    date (midnight local).  Accepted: ``50`` / ``50 messages`` ·
+    ``50 days`` / ``2 weeks`` / ``3 months`` / ``1 year`` / ``30 min`` ·
+    ``10.11.2026`` / ``10.11.`` (European) · ``11/10/2026`` / ``11/10``
+    (US) · ``2026-11-10`` (ISO).
+    """
+    text = " ".join(args.split()).casefold().rstrip(".")
+    if not text:
+        return ""
+    m = _PRUNE_SPAN_RE.match(text)
+    if m and m.group(2) in _PRUNE_UNITS:
+        n = int(m.group(1))
+        unit = _PRUNE_UNITS[m.group(2)]
+        if unit == "messages":
+            return ("count", n)
+        label = unit[:-1] if n == 1 else unit
+        return ("span", _prune_span_cutoff(n, unit, time.time()),
+                f"{n} {label}")
+    m = _PRUNE_COUNT_RE.match(text)
+    if m:
+        return ("count", int(m.group(1)))
+    date = _prune_date(text)
+    if date is not None:
+        y, mo, d = date
+        try:
+            cutoff = time.mktime((y, mo, d, 0, 0, 0, 0, 1, -1))
+        except (ValueError, OverflowError):
+            return ""
+        return ("date", cutoff, f"{d:02d}.{mo:02d}.{y:04d}")
+    return ""
+
+
+def _prune_phrases(spec: tuple) -> tuple[str, str]:
+    """The two wordings of a retention spec for the summary note:
+    what was *kept*, and the state of everything already being kept."""
+    if spec[0] == "count":
+        phrase = f"my last {spec[1]} message(s)"
+    elif spec[0] == "span":
+        phrase = f"the last {spec[2]}"
+    else:
+        phrase = f"{spec[2]} or newer"
+    kept = f"kept {phrase}"
+    within = (f"already within {phrase}" if spec[0] != "date"
+              else f"already {phrase}")
+    return kept, within
+
+
+def sender_may_redact(power_levels: dict, sender: str) -> bool:
+    """``/prune``'s policy gate: whether ``sender`` holds the room's redact
+    power per its ``m.room.power_levels`` content — their level (or
+    ``users_default``) against the level required for ``m.room.redaction``
+    events (``events`` map, else the legacy ``redact`` key, else 50)."""
+    users = power_levels.get("users") or {}
+    level = users.get(sender)
+    if level is None:
+        fold = sender.casefold()
+        level = next((lv for uid, lv in users.items()
+                      if str(uid).casefold() == fold), None)
+    if level is None:
+        level = power_levels.get("users_default", 0)
+    required = (power_levels.get("events") or {}).get(
+        "m.room.redaction", power_levels.get("redact", 50))
+    try:
+        return int(level) >= int(required)
+    except (TypeError, ValueError):
+        return False
+
+
+def _prune_retry_wait(exc: MatrixError, attempt: int) -> float:
+    """Seconds to sit out after a 429: the server's ``retry_after_ms``
+    when it sent one (capped at 30 s — a run's own time budget bounds how
+    long a rate-limited prune can drag on), else a growing backoff."""
+    payload = exc.payload if isinstance(exc.payload, dict) else {}
+    try:
+        ms = float(payload.get("retry_after_ms") or 0)
+    except (TypeError, ValueError):
+        ms = 0.0
+    return max(0.5, min(ms / 1000.0 if ms else 1.5 * (attempt + 1), 30.0))
+
+
 #: leading zero-width characters that make a message invisible to bots
 #: (both verified to survive the Matrix wire untouched and to render as
 #: nothing — clients show no tofu)
@@ -445,11 +643,23 @@ RUN_TIMEOUT_DEFAULT = 300
 #: upper bound accepted for ``/mute`` minutes (24 h)
 MUTE_MAX_MINUTES = 1440
 
-#: the menu ``/help`` posts into the room
+#: ``/prune`` walk limits: events fetched per ``/messages`` page, maximum
+#: pages walked, maximum events redacted and the total time budget of one
+#: run.  Rate-limited redactions wait out the server's ``retry_after_ms``,
+#: so a huge room simply ends in "run /prune again to continue" (redacted
+#: messages do not count as kept, so the next run picks up where this one
+#: stopped).
+PRUNE_PAGE_LIMIT = 100
+PRUNE_MAX_PAGES = 200
+PRUNE_MAX_REDACTIONS = 5000
+PRUNE_TIME_BUDGET_SECONDS = 600
+
+#: the menu ``/help`` posts into the room (short on purpose — the details
+#: live behind ``/help <command>``)
 HELP_TEXT = (
     "ℹ️ Commands in this room:\n"
     "• stop — interrupt the action running here (acked by reaction)\n"
-    "• /help — this menu\n"
+    "• /help [command] — this menu, or the details on one command\n"
     "• /status — what the bot is doing right now + room session state\n"
     "• /effort [default|low|mid|high|xhigh] — show or set the reasoning "
     "effort for this room\n"
@@ -461,12 +671,60 @@ HELP_TEXT = (
     "session; with text, on the updated message instead\n"
     "• /mute [@bot] [minutes] — mute this bot here (no minutes = "
     "permanent); /mute 0 or /unmute unmutes\n"
+    "• @bot /prune <retention> — the mentioned bot(s) redact their own "
+    "older messages (/help prune)\n"
     f"Any message within {SESSION_WINDOW_SECONDS // 60} min of the last "
     "answer continues this room's session; a message starting with a "
     "zero-width character is invisible to bots. In group chats you can "
     "address a command to one bot with a leading mention "
     "(@bot /status). Everything else is handled by this room's trigger."
 )
+
+#: the detail texts behind ``/help <command>``
+COMMAND_HELP = {
+    "stop": "🛑 stop — interrupts the action(s) running for this room: the "
+            "OpenCode run is aborted, reply waiters released and any call "
+            "hung up; it also ends a /prune in progress. Acked by "
+            "reaction (🛑 something stopped / ⭕ nothing was running).",
+    "help": "ℹ️ /help [command] — posts this menu; with a command name "
+            "(/help prune) only the details on that command.",
+    "status": "📊 /status — what the bot is doing in this room right now "
+              "(thinking / running a tool / writing the answer), the code "
+              "version and the room's live session, effort and mute state.",
+    "effort": "⚙️ /effort [default|low|mid|high|xhigh] — show or set this "
+              "room's reasoning effort (persisted); every run started in "
+              "the room afterwards uses it as its model variant.",
+    "btw": "📣 /btw <text> — feeds the text into the action(s) currently "
+           "running for this room (steers the model mid-turn) instead of "
+           "starting a new run or answering as chat.",
+    "new": f"🆕 /new [text] — closes this room's live session; with text, "
+           f"runs that text immediately in a fresh session (with the "
+           f"room's trigger action, so persona/placeholders apply). The "
+           f"session stays open {SESSION_WINDOW_SECONDS // 60} min "
+           f"between messages anyway.",
+    "end": "🆕 /end — closes this room's live session (ack only — the "
+           "next message starts a fresh one).",
+    "revert": "↩️ /revert [text] — closes the live session and re-fires "
+              "this room's last trigger message in a fresh session; with "
+              "text, the trigger runs on that updated message instead of "
+              "the original one. /retry is an alias.",
+    "mute": "🔇 /mute [@bot] [minutes] — mutes this bot in this room (no "
+            "minutes = permanent, /mute 0 unmutes); with @name only the "
+            "bot it matches mutes itself. A muted bot ignores everything "
+            "except stop, /help, /status, /mute and /unmute.",
+    "unmute": "🔊 /unmute [@bot] — ends the bot's mute in this room.",
+    "prune": "🧹 @bot /prune <retention> — every mentioned bot redacts "
+             "its OWN messages older than the retention window. "
+             "Destructive, so the command must name the bot(s) "
+             "(@kraken /prune 50) and you yourself need redact power in "
+             "this room. Retention: 50 or 50 messages = keep the bot's "
+             "last 50 · 50 days / 2 weeks / 3 months / 1 year / 30 min = "
+             "keep that span (also min, h, d, w, mo, y) · a date = keep "
+             "from that day: 10.11.2026 or 10.11. (European, day first), "
+             "11/10/2026 or 11/10 (US, month first), 2026-11-10 (ISO). "
+             "Long rooms are pruned in steps (redaction is rate-limited) "
+             "— repeat the command to continue; stop ends a prune.",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +836,8 @@ class _Session:
     exactly once (whichever of the run's end / a stop claim wins it via
     ``cleaned``)."""
 
-    __slots__ = ("room_id", "session_ids", "reactions", "cancelled", "cleaned")
+    __slots__ = ("room_id", "session_ids", "reactions", "cancelled",
+                 "cleaned", "label")
 
     def __init__(self, room_id: str) -> None:
         self.room_id = room_id
@@ -586,6 +845,9 @@ class _Session:
         self.reactions: list[str] = []
         self.cancelled = False
         self.cleaned = False
+        #: what ``/status`` shows while a run has no OpenCode session yet
+        #: (``/prune`` marks itself; empty = "starting up")
+        self.label = ""
 
 
 class MessageWatcher:
@@ -1228,10 +1490,17 @@ class MessageWatcher:
 
     # -- /help command ----------------------------------------------------------
 
-    def _help_room(self, room_id: str) -> None:
-        """``/help`` posts the command menu into the room."""
-        self._send_note(room_id, HELP_TEXT)
-        _log(f"{self.tag} /help for {room_id}")
+    def _help_room(self, room_id: str, topic: str = "") -> None:
+        """``/help`` posts the command menu, ``/help <command>`` the details
+        on that one command (so the menu itself stays short)."""
+        if not topic:
+            self._send_note(room_id, HELP_TEXT)
+        elif topic in COMMAND_HELP:
+            self._send_note(room_id, COMMAND_HELP[topic])
+        else:
+            self._send_note(room_id, f"❔ No command '{topic}' — /help "
+                                     f"lists what there is.")
+        _log(f"{self.tag} /help{f' {topic}' if topic else ''} for {room_id}")
 
     # -- /status command ----------------------------------------------------------
 
@@ -1252,7 +1521,7 @@ class MessageWatcher:
         for sess in active:
             sid = sess.session_ids[-1] if sess.session_ids else ""
             state = self.bot.opencode.session_activity(sid) if sid \
-                else "starting up"
+                else (sess.label or "starting up")
             icon = ("✍️" if state.startswith("writing")
                     else {"thinking": "🧠", "idle": "💤",
                           "unknown": "❔"}.get(state, "⚙️"))
@@ -1480,6 +1749,212 @@ class MessageWatcher:
                          name=f"revert-{self.bot.name}".replace("/", "_"),
                          daemon=True).start()
 
+    # -- /prune command ---------------------------------------------------------------
+
+    PRUNE_USAGE = (
+        "🧹 Usage: @bot /prune <retention> — every named bot redacts its "
+        "own older messages (you need this room's redact power). "
+        "Retention: a count (50), a span (50 days, 2 weeks, 1 year) or a "
+        "date (10.11.2026) — /help prune lists every accepted form.")
+
+    def _prune_room(self, room_id: str, args: str, ev: dict,
+                    mentioned: list[str]) -> None:
+        """``@bot /prune <retention>``: the named bot(s) redact their OWN
+        messages older than the retention window (module docstring 2i).
+
+        Destructive, so two gates: the command must name this bot (leading
+        mention or mention pill — an untagged ``/prune`` in a multi-bot
+        room would otherwise let one stray message wipe every bot), and
+        the sender must hold the room's redact power. The walk itself runs
+        as a cancellable room session: 🔧 on the command message, ``stop``
+        ends it, ``/status`` shows it.
+        """
+        if not (mentioned or extract_mentions(ev)):
+            self._send_note(
+                room_id, f"🧹 Destructive, so name the bot(s) to prune: "
+                         f"{self.bot.user_id} /prune 50 keeps my last 50 "
+                         f"messages — /help prune explains the retention.")
+            return
+        spec = parse_prune_spec(args)
+        if not spec:
+            self._send_note(room_id, self.PRUNE_USAGE)
+            return
+        sender = ev.get("sender") or ""
+        try:
+            pl = self.bot.client.power_levels(room_id)
+        except MatrixError as exc:
+            self._send_note(room_id,
+                            f"🧹 Could not check this room's power levels: "
+                            f"{exc}")
+            return
+        if not sender_may_redact(pl, sender):
+            self._send_note(room_id,
+                            f"🧹 {sender} does not hold this room's redact "
+                            f"power — a prune from you would be refused by "
+                            f"the server anyway.")
+            return
+        kept, _ = _prune_phrases(spec)
+        _log(f"{self.tag} /prune {args!r} in {room_id} by {sender} "
+             f"-> walking the history ({kept})")
+        threading.Thread(target=self._prune_run, args=(room_id, spec, ev),
+                         name=f"prune-{self.bot.name}".replace("/", "_"),
+                         daemon=True).start()
+
+    def _prune_run(self, room_id: str, spec: tuple, ev: dict) -> None:
+        """Background walk started by ``/prune``: page through the history
+        newest→oldest and redact the bot's own messages outside the
+        retention window.
+
+        Rate-limited (429) redactions sit out the server's ``retry_after_ms``
+        (``_prune_retry_wait``), so the walk is bounded by page, redaction
+        and time budgets — a huge room ends in "run /prune again to
+        continue".  Already-redacted events are skipped and NOT counted as
+        kept, which is exactly what makes the next run resume where this
+        one stopped.
+        """
+        tag = f"[prune:{self.bot.name}]"
+        key = room_id.casefold()
+        sess = _Session(room_id)
+        sess.label = "pruning old messages"
+        with self._session_lock:
+            self._sessions.setdefault(key, []).append(sess)
+        rid = self._react_on(room_id, ev.get("event_id"))
+        if rid:
+            with self._session_lock:
+                sess.reactions.append(rid)
+        keep_count = spec[1] if spec[0] == "count" else None
+        cutoff_ms = None if keep_count is not None else spec[1] * 1000
+        me = self.bot.user_id.casefold()
+        started = time.monotonic()
+        deadline = started + PRUNE_TIME_BUDGET_SECONDS
+        token: str | None = None
+        own_seen = redacted = failed = 0
+        stop_reason = ""
+        try:
+            for _page in range(PRUNE_MAX_PAGES):
+                if sess.cancelled or self._stop.is_set():
+                    stop_reason = "stopped"
+                    break               # noticed even outside delete ranges
+                try:
+                    page = self.bot.client.messages_page(
+                        room_id, from_token=token, limit=PRUNE_PAGE_LIMIT)
+                except MatrixError as exc:
+                    if exc.status == 400:
+                        break               # the token hit the room's start
+                    stop_reason = f"the history walk failed ({exc})"
+                    break
+                chunk = page.get("chunk") or []
+                for event in sorted(chunk, key=lambda e:
+                                    e.get("origin_server_ts") or 0,
+                                    reverse=True):
+                    eid = event.get("event_id")
+                    if not eid or event.get("type") not in (
+                            "m.room.message", "m.room.encrypted"):
+                        continue
+                    if str(event.get("sender") or "").casefold() != me:
+                        continue
+                    if (event["type"] == "m.room.message"
+                            and not isinstance(
+                                (event.get("content") or {}).get("body"),
+                                str)):
+                        continue    # already redacted: neither kept nor counted
+                    if keep_count is not None:
+                        own_seen += 1
+                        if own_seen <= keep_count:
+                            continue        # one of the kept messages
+                    elif (event.get("origin_server_ts") or 0) >= cutoff_ms:
+                        continue            # inside the retention window
+                    if sess.cancelled or self._stop.is_set():
+                        stop_reason = "stopped"
+                        break
+                    if time.monotonic() >= deadline:
+                        stop_reason = (f"the "
+                                       f"{PRUNE_TIME_BUDGET_SECONDS}s time "
+                                       f"budget ran out")
+                        break
+                    if redacted >= PRUNE_MAX_REDACTIONS:
+                        stop_reason = (f"the {PRUNE_MAX_REDACTIONS}-redaction "
+                                       f"limit was reached")
+                        break
+                    if self._prune_redact(tag, room_id, eid,
+                                          lambda: (sess.cancelled
+                                                   or self._stop.is_set())):
+                        redacted += 1
+                    else:
+                        failed += 1
+                if stop_reason:
+                    break
+                end = page.get("end") or ""
+                if not chunk or not end or end == token:
+                    break               # reached the start of the room
+                token = end
+            else:
+                stop_reason = (f"the {PRUNE_MAX_PAGES}-page walk limit "
+                               f"was reached")
+        except Exception as exc:  # noqa: BLE001 - the note below must go out
+            _log(f"{tag} unexpected error: {exc!r}")
+            stop_reason = f"the walk crashed ({exc!r})"
+        kept_phrase, within_phrase = _prune_phrases(spec)
+        _log(f"{tag} {room_id}: {redacted} redacted, {failed} failed in "
+             f"{time.monotonic() - started:.0f}s "
+             f"({stop_reason or 'complete'})")
+        if stop_reason == "stopped":
+            note = (f"🧹 Prune stopped — {redacted} message(s) redacted. "
+                    f"Run /prune again to continue.")
+        elif stop_reason:
+            note = (f"🧹 {redacted} of my message(s) redacted — "
+                    f"{stop_reason}. Run /prune again to continue.")
+        elif redacted:
+            note = (f"🧹 {redacted} of my message(s) redacted, "
+                    f"{kept_phrase}.")
+        elif failed:
+            note = (f"⚠️ /prune: {failed} message(s) could not be redacted "
+                    f"(see the service log).")
+        else:
+            note = (f"🧹 Nothing to redact — my messages here are "
+                    f"{within_phrase}.")
+        if failed and redacted:
+            note += f" ({failed} could not be redacted)"
+        self._send_note(room_id, note)
+        with self._session_lock:
+            live = self._sessions.get(key)
+            if live and sess in live:
+                live.remove(sess)
+        self._clean_up(sess)
+
+    def _prune_redact(self, tag: str, room_id: str, event_id: str,
+                      cancelled) -> bool:
+        """Redact one event, sitting out ``429`` rate-limits.
+
+        The txn id is fixed for every retry of this event, so a request
+        that got through before a network error cannot double-redact.
+        True when the event is redacted (or already gone).
+        """
+        txn = f"whk-prune-{secrets.token_hex(8)}"
+        for attempt in range(4):
+            if cancelled():
+                return False
+            try:
+                self.bot.client.redact(room_id, event_id, reason="/prune",
+                                       txn=txn)
+                return True
+            except MatrixError as exc:
+                if exc.status == 404:
+                    return True         # already gone: counts as redacted
+                if exc.status == 429 and attempt < 3:
+                    self._stop.wait(_prune_retry_wait(exc, attempt))
+                    continue
+                _log(f"{tag} redacting {event_id} failed: {exc}")
+                return False
+            except OSError as exc:      # requests' network errors are OSErrors
+                if attempt < 3:
+                    self._stop.wait(_prune_retry_wait(
+                        MatrixError(0, "network"), attempt))
+                    continue
+                _log(f"{tag} redacting {event_id} failed: {exc}")
+                return False
+        return False
+
     # -- run outcome --------------------------------------------------------------
 
     def _post_outcome(self, room_id: str, sess: _Session, result,
@@ -1566,8 +2041,9 @@ class MessageWatcher:
             self._stop_room(room_id, where, ev.get("event_id") or "")
             return
 
-        if parse_help_command(cmd_body):
-            self._help_room(room_id)
+        is_help, help_topic = parse_help_command(cmd_body)
+        if is_help:
+            self._help_room(room_id, help_topic)
             return
 
         if parse_status_command(cmd_body):
@@ -1611,6 +2087,11 @@ class MessageWatcher:
         is_revert, revert_text = parse_revert_command(cmd_body)
         if is_revert:
             self._revert_room(room_id, room_name, revert_text)
+            return
+
+        is_prune, prune_args = parse_prune_command(cmd_body)
+        if is_prune:
+            self._prune_room(room_id, prune_args, ev, mentioned)
             return
 
         if not addressed_to_bot(ev, self.bot.user_id):

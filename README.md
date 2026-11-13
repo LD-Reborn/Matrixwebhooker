@@ -238,7 +238,9 @@ literal `@user:server` in the text; quoted reply fallback lines
 pipeline — no trigger fires and a message is not handed to a waiting
 client either. Commands (`stop`, `/help`, `/status`, `/effort`, `/btw`,
 `/new`, `/end`, `/revert`, `/mute`, `/unmute`) are unaffected, and
-the bot's own messages are skipped anyway.
+the bot's own messages are skipped anyway. (`/prune` is the deliberate
+exception: being destructive, it *requires* an explicit mention — see
+"Pruning old messages".)
 
 **Bot ↔ bot silence.** Two agents that each answer every untagged room
 message echo each other forever, no matter what the models say. So a
@@ -360,7 +362,7 @@ plain "btw …" in chat, which stays a normal message, the `/` is required.)
 | command | what it does |
 |---|---|
 | `stop` | interrupt the action running in this room (acked by reaction) |
-| `/help` | this menu |
+| `/help [command]` | this menu — or the details on one command (`/help prune`) |
 | `/status` | what the bot is doing right now (thinking / running a tool / writing) + code version, session, effort, mute |
 | `/effort [default\|low\|mid\|high\|xhigh]` | show / set the reasoning effort for this room |
 | `/btw <text>` | interject into the action currently running here |
@@ -369,6 +371,7 @@ plain "btw …" in chat, which stays a normal message, the `/` is required.)
 | `/revert [text]` | re-run this room's last trigger message in a fresh session — with `text`, on the updated message instead |
 | `/mute [@bot] [minutes]` | mute this bot here (no minutes = permanent; `/mute 0` unmutes) |
 | `/unmute [@bot]` | end the mute |
+| `@bot /prune <retention>` | the named bot(s) redact their own older messages (needs your redact power) |
 
 As with every command here: the leading `/` is required, the message must
 be the command — or the command **behind leading mentions**, so in a group
@@ -416,6 +419,39 @@ the bot it matches acts and the others ignore the command silently, so
 free (`/mute 15 @bot` too), and the leading-mention form
 `@kraken @lucretia-pc /mute 15` addresses the command to those bots.
 Mutes persist across restarts.
+
+### Pruning old messages (`/prune`)
+
+Long-lived rooms (especially a bot consortium) fill up with history.
+`@bot /prune <retention>` makes every **mentioned** bot redact its **own**
+messages older than the retention window:
+
+```
+@kraken /prune 50            # keep kraken's last 50 messages
+@kraken @lucretia-pc /prune 2 weeks
+@kraken /prune 10.11.2026    # keep everything from Nov 10 on
+```
+
+- **It must name its bot(s).** Destructive: an untagged `/prune` in a
+  multi-bot room would wipe every bot, so a leading mention (or mention
+  pill) is required — a bot that is not named ignores the command, and an
+  untagged `/prune` is refused with a usage note.
+- **You need the room's redact power** (your level in
+  `m.room.power_levels` against the level required for `m.room.redaction`,
+  default 50). The bot itself only ever redacts its own messages — which
+  any sender may do regardless of its level.
+- Retention forms: a count (`50`, `50 messages`), a span (`50 days`,
+  `2 weeks`, `3 months`, `1 year`, `30 min` — also `min/h/d/w/mo/y`) or a
+  date: `10.11.2026` / `10.11.` (European, day first), `11/10/2026` /
+  `11/10` (US, month first), `2026-11-10` (ISO). A missing year means
+  this year; an obviously swapped day/month is accepted by swapping.
+- The walk (newest→oldest via `/messages`) runs as a cancellable room
+  session: 🔧 on the command, `stop` ends it, `/status` shows it.
+  Redaction is rate-limited (`429` → the server's `retry_after_ms`), so
+  the walk is bounded by page/redaction/time budgets — a huge room simply
+  ends in *"run /prune again to continue"*, and since already-redacted
+  messages are neither kept nor counted, the next run resumes exactly
+  where this one stopped.
 
 ### Invisible messages (bot echo safety)
 

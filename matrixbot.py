@@ -556,6 +556,22 @@ class Matrix:
             rooms.append({"room_id": rid, "name": name})
         return rooms
 
+    def messages_page(self, room_id: str, from_token: str | None = None,
+                      limit: int = 100) -> dict:
+        """One raw ``/messages`` page walking *backwards* (newest first).
+
+        For history walks (the room ``/prune``): returns the server payload
+        with ``chunk`` (raw events, no decryption / filtering) and the
+        ``start`` / ``end`` pagination tokens — pass ``end`` back as
+        ``from_token`` until it runs empty.
+        """
+        params = {"dir": "b", "limit": str(max(1, min(int(limit), 100)))}
+        if from_token:
+            params["from"] = from_token
+        return self._request("GET", f"{self.hs}/_matrix/client/v3/rooms/"
+                                    f"{quote(room_id, safe='')}/messages",
+                             params=params)
+
     def read_messages(self, room_id: str, limit: int = 50,
                       crypto: BotCrypto | None = None) -> list[dict]:
         """Last ``limit`` room events (m.room.message + m.reaction), oldest first.
@@ -895,12 +911,22 @@ class Matrix:
                 raise
             return data.get("event_id")
 
+    def redact(self, room_id: str, event_id: str, reason: str = "",
+               txn: str | None = None) -> dict:
+        """Redact (delete) an event.
+
+        The server allows it for the event's own sender or for users with
+        the room's ``redact`` power level.  A fixed ``txn`` may be passed to
+        make retries of one redaction idempotent (e.g. after a 429).
+        """
+        txn = txn or f"whk-{secrets.token_hex(8)}"
+        url = (f"{self.hs}/_matrix/client/v3/rooms/{quote(room_id, safe='')}/"
+               f"redact/{quote(event_id, safe='')}/{txn}")
+        return self._request("PUT", url, {"reason": reason} if reason else {})
+
     def unreact(self, room_id: str, reaction_event_id: str) -> None:
         """Remove a reaction by redacting the reaction event it produced."""
-        txn = f"whk-{secrets.token_hex(8)}"
-        url = (f"{self.hs}/_matrix/client/v3/rooms/{quote(room_id, safe='')}/"
-               f"redact/{quote(reaction_event_id, safe='')}/{txn}")
-        self._request("PUT", url, {})
+        self.redact(room_id, reaction_event_id)
 
     def join(self, room_id: str) -> None:
         self._request("POST", f"{self.hs}/_matrix/client/v3/rooms/{quote(room_id)}/join")
@@ -910,6 +936,19 @@ class Matrix:
         data = self._request("GET", f"{self.hs}/_matrix/client/v3/rooms/"
                                     f"{quote(room_id, safe='')}/joined_members")
         return list((data.get("joined") or {}).keys())
+
+    def power_levels(self, room_id: str) -> dict:
+        """The room's ``m.room.power_levels`` state content (``{}`` when the
+        room somehow has none).  The trailing slash is the empty state key
+        (see ``_fix_power_levels.py`` for this server's quirk)."""
+        try:
+            return self._request("GET", f"{self.hs}/_matrix/client/v3/rooms/"
+                                        f"{quote(room_id, safe='')}"
+                                        "/state/m.room.power_levels/")
+        except MatrixError as exc:
+            if exc.status == 404:
+                return {}
+            raise
 
     def send_to_device(self, event_type: str, messages: dict) -> dict:
         """Send a to-device event.  ``messages`` maps user id -> device id
