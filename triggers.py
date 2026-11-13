@@ -129,6 +129,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+from urllib.parse import unquote
 
 from crypto import CryptoError
 from matrixbot import BASE_DIR, Bot, MatrixError
@@ -292,14 +293,19 @@ _UNMUTE_RE = re.compile(r"^/unmute\b[\s,]*(.*)$", re.IGNORECASE | re.DOTALL)
 
 #: ``@user[:domain]`` / ``@room`` / ``@here`` tokens at the very start of a
 #: message — they may introduce a command addressed to one bot
-#: ("@kraken /status"), in which case only the tagged bots act
+#: ("@kraken /status"), in which case only the tagged bots act.  The
+#: markdown-pill form Element puts in the plain body
+#: (``[@user:server](https://matrix.to/#/@user:server) /status``) counts
+#: too; the mentioned id then comes from the link target (URL-decoded).
 _CMD_MENTION_RE = re.compile(
-    r"^(@[A-Za-z0-9._=/+-]+(?::[A-Za-z0-9.-]+)?)[\s,]+")
+    r"^(?:(?P<plain>@[A-Za-z0-9._=/+-]+(?::[A-Za-z0-9.-]+)?)"
+    r"|(?P<pill>\[[^\]]*\]\(https?://matrix\.to/\#/"
+    r"(?P<mxid>(?:@|%40)[^\s)]+)\)))[\s,]+")
 
 
 def strip_leading_mentions(body: str | None) -> tuple[str | None, list[str]]:
-    """Peel leading ``@user[:domain]`` tokens (plus whitespace) off a body:
-    ``(remaining, mentioned)``.
+    """Peel leading ``@user[:domain]`` tokens or markdown pills (plus
+    whitespace) off a body: ``(remaining, mentioned)``.
 
     Lets ``@bot /status`` or ``@bot stop`` address a command to a single
     bot in a group chat: the command then parses against the remainder and
@@ -314,7 +320,7 @@ def strip_leading_mentions(body: str | None) -> tuple[str | None, list[str]]:
         m = _CMD_MENTION_RE.match(text)
         if m is None:
             return text, mentioned
-        mentioned.append(m.group(1))
+        mentioned.append(m.group("plain") or unquote(m.group("mxid")))
         text = text[m.end():]
 
 
@@ -827,6 +833,17 @@ def render_text(template: str, values: dict[str, str]) -> str:
 # ---------------------------------------------------------------------------
 # Per-bot watcher
 # ---------------------------------------------------------------------------
+
+
+def _session_vanished(result) -> bool:
+    """True when a continuation of the room's live session failed because
+    the OpenCode server does not know the session any more (deleted
+    server-side — a session cleanup, a prune, a lost storage).  The
+    message then gets a fresh run instead of a ⚠️ notice."""
+    if result.outcome != "error":
+        return False
+    err = (result.error or "").casefold()
+    return "404" in err and "not found" in err
 
 
 class _Session:
@@ -2185,6 +2202,7 @@ class MessageWatcher:
                 self._remember_session(room_id, str(cont.get("id")),
                                        managed=bool(cont.get("managed")))
             return
+        result = None
         if cont:
             sid = str(cont.get("id"))
             managed = bool(cont.get("managed"))
@@ -2202,7 +2220,17 @@ class MessageWatcher:
                 sid, prompt=render_text(action.prompt, values),
                 timeout=action.timeout, cancel=lambda: sess.cancelled,
                 keep_session=True, log=lambda m: _log(f"{tag} {m}"))
-        else:
+            if _session_vanished(result):
+                # the OpenCode server lost the session behind our back
+                # (a session cleanup, a prune, lost storage) — do not let
+                # the message die with ⚠️, run it in a fresh session
+                _log(f"{tag} live session {sid} is gone server-side — "
+                     f"running fresh instead")
+                with self._session_lock:
+                    if sid in sess.session_ids:
+                        sess.session_ids.remove(sid)
+                result = None
+        if result is None:
             managed = not action.keep_session
             try:
                 history = self.bot.client.read_messages(
