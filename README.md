@@ -361,7 +361,7 @@ plain "btw …" in chat, which stays a normal message, the `/` is required.)
 |---|---|
 | `stop` | interrupt the action running in this room (acked by reaction) |
 | `/help` | this menu |
-| `/status` | what the bot is doing right now (thinking / running a tool / writing) + session, effort, mute |
+| `/status` | what the bot is doing right now (thinking / running a tool / writing) + code version, session, effort, mute |
 | `/effort [default\|low\|mid\|high\|xhigh]` | show / set the reasoning effort for this room |
 | `/btw <text>` | interject into the action currently running here |
 | `/new [text]` | close the room's session; with text, start a fresh run right away |

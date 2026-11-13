@@ -27,8 +27,9 @@ bot receives — any channel it is in, including DMs — in this order:
   2a. ``/help`` posts the command menu; ``/status`` reports the live
       activity of every run in flight (thinking / running a tool /
       writing the answer — see ``opencode_api.session_activity``) plus
-      the room's session, effort and mute state.  Both always work,
-      also when muted.
+      the code version (``version.app_version``, git describe) and the
+      room's session, effort and mute state.  Both always work, also
+      when muted.
   2b. ``/mute [@bot] [minutes]`` mutes this bot in this room (a
       ``@name`` targeting another user only makes the bot it matches
       act, the others stay silent; no minutes = permanent mute),
@@ -123,6 +124,7 @@ from pathlib import Path
 from crypto import CryptoError
 from matrixbot import BASE_DIR, Bot, MatrixError
 from opencode_api import OpenCodeError
+from version import app_version
 
 #: Hard cap (seconds) for POST /wait and the MCP wait_for_reply tool.
 MAX_WAIT_SECONDS = 600
@@ -1238,11 +1240,12 @@ class MessageWatcher:
 
         For every run in flight it asks the OpenCode server for the live
         activity (``session_activity``: thinking / running a tool and
-        awaiting its result / writing the answer), then adds the room's
-        session window, effort and mute state.  Works while muted.
+        awaiting its result / writing the answer), then adds the
+        deployed code version and the room's session window, effort and
+        mute state.  Works while muted.
         """
         key = room_id.casefold()
-        lines: list[str] = []
+        lines: list[str] = [f"🏷️ code: {app_version()}"]
         with self._session_lock:
             active = list(self._sessions.get(key, []))
             entry = dict(self._room_sessions.get(key) or {})

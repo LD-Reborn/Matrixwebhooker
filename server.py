@@ -51,6 +51,7 @@ from flask import Flask, jsonify, request
 
 from matrixbot import BASE_DIR, Bot, ConfigError, MatrixError, load_settings
 from triggers import MAX_WAIT_SECONDS, MessageWatcher, WaitRegistry
+from version import app_version
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -366,7 +367,7 @@ def main() -> None:
         w.start()
         watchers.append(w)
     print(f"Webhooker ready: {len(BOTS)} bot(s) on {settings.homeserver} "
-          f"({len(watchers)} watcher(s) active)")
+          f"({len(watchers)} watcher(s) active, code {app_version()})")
     app.run(host=settings.host, port=settings.port, debug=False, threaded=True)
 
 
