@@ -342,6 +342,19 @@ class OpenCodeClient:
                     result.error = str(error.get("message") or error)
                 elif error:
                     result.error = str(error)
+                if result.outcome == "failed" and not result.error:
+                    # a turn that dies mid-request (e.g. model not found)
+                    # sometimes reports the error only on its assistant
+                    # message — the idle note comes bare, so dig it out here
+                    # instead of answering the room with "unknown error".
+                    for m in messages:
+                        err = m.get("error")
+                        if isinstance(err, dict):
+                            result.error = str(err.get("message") or err)
+                        elif err:
+                            result.error = str(err)
+                        if result.error:
+                            break
                 if result.outcome == "succeeded":
                     # messages come newest first: the first assistant message
                     # is the final answer of this turn
