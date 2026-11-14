@@ -232,9 +232,12 @@ therefore reacts once **it is tagged too** — alone or among others:
 | `@jemandanderes mach das mal` | **no** — clearly not for the bot |
 | `@room Hilfe!` | yes — a broadcast tags everyone |
 
-"Tagged" means the client's `m.mentions` property (mention pills) or a
-literal `@user:server` in the text; quoted reply fallback lines
-(`> <@user:server> …`) do not count as a tag. The gate covers the whole
+"Tagged" means the client's `m.mentions` property (mention pills), a
+literal `@user:server`, or a bare `@name` in the text — the bare form
+resolves against the bot's own homeserver (`@kraken` is
+`@kraken:matrix.ld50.dev` for a local bot; cross-server names need the
+full MXID). Quoted reply fallback lines (`> <@user:server> …`) do not
+count as a tag. The gate covers the whole
 pipeline — no trigger fires and a message is not handed to a waiting
 client either. Commands (`stop`, `/help`, `/status`, `/effort`, `/btw`,
 `/new`, `/end`, `/revert`, `/mute`, `/unmute`) are unaffected, and

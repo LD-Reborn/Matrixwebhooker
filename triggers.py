@@ -54,14 +54,16 @@ bot receives — any channel it is in, including DMs — in this order:
       in a fresh session (the live one is closed first); with text, the
       trigger runs on that updated message instead of the original one.
   2g. mention gate: a message that *tags* someone explicitly (an
-      ``m.mentions`` pill, or a plain ``@user:server`` in the text) is
-      meant for that person — the bot stays completely silent unless it is
-      tagged **too** (alone or among others; ``@room``/``@here`` tag it as
-      well). Messages that tag nobody are for everyone and handled as
-      before. This keeps one bot from answering messages another bot (or
-      human) was addressed with.  Commands are addressable the same way:
-      a message that *starts* with mentions is parsed as a command behind
-      them (``@bot /status``, ``@bot stop``) and only runs on the tagged
+      ``m.mentions`` pill, or a plain ``@user:server`` or bare ``@name``
+      in the text — a bare name resolves against the bot's own
+      homeserver, like pills for local users) is meant for that person —
+      the bot stays completely silent unless it is tagged **too** (alone
+      or among others; ``@room``/``@here`` tag it as well). Messages that
+      tag nobody are for everyone and handled as before. This keeps one
+      bot from answering messages another bot (or human) was addressed
+      with.  Commands are addressable the same way: a message that
+      *starts* with mentions is parsed as a command behind them
+      (``@bot /status``, ``@bot stop``) and only runs on the tagged
       bots — the others stay silent instead of answering it as chat.
   2h. sibling-bot gate: messages from the roster's *other* bots (the bot
       users in ``bots.json``, plus foreign webhookers' bots listed in the
@@ -187,19 +189,35 @@ def is_stop_command(body: str | None) -> bool:
 #: a full Matrix user id in plain text — typed by hand or the reply-fallback
 #: quote clients put in front of a reply
 _MXID_RE = re.compile(r"@[A-Za-z0-9._=/+-]+:[A-Za-z0-9.-]+")
+#: a bare ``@name`` without a homeserver; a colon after the name makes it a
+#: full MXID (``_MXID_RE`` claims it), and a preceding word char or URL char
+#: makes it an e-mail or link fragment, not a tag
+_BARE_MENTION_RE = re.compile(r"(?<![\w.:/@+-])@([A-Za-z0-9._=/+-]+)(?![:\w])")
+#: room broadcasts — mentions of everybody, not of a user id
+_BROADCAST_NAMES = {"room", "here"}
 #: quoted reply-fallback lines (``> <@user:server> …``): they quote someone
 #: else's message instead of tagging them — not a tag by this sender
 _QUOTED_RE = re.compile(r"^\s*>.*$", re.MULTILINE)
 
 
-def extract_mentions(ev: dict) -> set[str]:
+def _server_of(user_id: str) -> str | None:
+    """The homeserver part of ``@local:server`` (None for a bare id)."""
+    _, sep, rest = (user_id or "").partition(":")
+    return rest or None
+
+
+def extract_mentions(ev: dict, server_name: str | None = None) -> set[str]:
     """User ids (lower-cased) that a message event explicitly tags.
 
     The canonical source is the ``m.mentions`` property (kept as
     ``ev["mentions"]`` by ``matrixbot.sync()``) that clients set for pills;
     full ``@user:server`` strings in the plain body count too, since not
-    every client sends ``m.mentions``. Quoted reply-fallback lines are
-    ignored: they belong to the quoted message, not to this sender.
+    every client sends ``m.mentions``. Bare ``@name`` mentions count as
+    well when a ``server_name`` is passed: they resolve against the bot's
+    own homeserver, the same assumption pills make for local users —
+    cross-server names still need the full MXID. Quoted reply-fallback
+    lines are ignored: they belong to the quoted message, not to this
+    sender.
     """
     ids: set[str] = set()
     prop = ev.get("mentions")
@@ -207,19 +225,25 @@ def extract_mentions(ev: dict) -> set[str]:
         for uid in prop.get("user_ids") or []:
             if isinstance(uid, str):
                 ids.add(uid.casefold())
-    body = ev.get("body") or ""
-    ids.update(x.casefold() for x in _MXID_RE.findall(_QUOTED_RE.sub("", body)))
+    body = _QUOTED_RE.sub("", ev.get("body") or "")
+    ids.update(x.casefold() for x in _MXID_RE.findall(body))
+    if server_name:
+        srv = server_name.casefold()
+        ids.update(f"@{name.casefold()}:{srv}"
+                   for name in _BARE_MENTION_RE.findall(body)
+                   if name.lower() not in _BROADCAST_NAMES)
     return ids
 
 
 def tags_bot_itself(ev: dict, user_id: str) -> bool:
-    """True when the message tags this bot explicitly: pill or plain
-    ``@user:server`` text, or an ``@room``/``@here`` broadcast (tags all).
+    """True when the message tags this bot explicitly: pill, plain
+    ``@user:server`` or bare ``@name`` text, or an ``@room``/``@here``
+    broadcast (tags all).
     """
     prop = ev.get("mentions")
     if isinstance(prop, dict) and prop.get("room"):
         return True
-    return user_id.casefold() in extract_mentions(ev)
+    return user_id.casefold() in extract_mentions(ev, _server_of(user_id))
 
 
 def addressed_to_bot(ev: dict, user_id: str) -> bool:
@@ -231,7 +255,8 @@ def addressed_to_bot(ev: dict, user_id: str) -> bool:
     is tagged *too* (alone or among others). ``@room``/``@here`` broadcasts
     tag the bot as well and therefore always count.
     """
-    return not extract_mentions(ev) or tags_bot_itself(ev, user_id)
+    return (not extract_mentions(ev, _server_of(user_id))
+            or tags_bot_itself(ev, user_id))
 
 
 def is_silent_reply(text: str | None) -> bool:
@@ -2155,7 +2180,7 @@ class MessageWatcher:
         it; so does an ``m.mentions`` pill on it (Element turns typed
         mentions into pills plus the plain ``@user:server`` body text).
         """
-        if not tokens and not extract_mentions(ev):
+        if not tokens and not extract_mentions(ev, _server_of(self.bot.user_id)):
             return True
         if tags_bot_itself(ev, self.bot.user_id):
             return True
